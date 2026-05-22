@@ -11,7 +11,9 @@
   <ItemGroup>
     <Compile Remove="Stateforward.Hsm.Tests/**/*.cs" />
     <Compile Remove="Stateforward.Hsm.Benchmarks/**/*.cs" />
+    <Compile Remove="TrafficLightBench/**/*.cs" />
     <None Include="Stateforward.Hsm.Tests/**/*.cs" />
     <None Include="Stateforward.Hsm.Benchmarks/**/*.cs" />
+    <None Include="TrafficLightBench/**/*.cs" />
   </ItemGroup>
 </Project>

@@ -119,6 +119,55 @@ public sealed class Config
     public object? Data { get; init; }
     public TimeSpan ActivityTimeout { get; init; } = TimeSpan.FromMilliseconds(1);
     public Clock? Clock { get; init; }
+    public Queue? Queue { get; init; }
+}
+
+internal sealed class PendingEvent
+{
+    public PendingEvent(Event @event)
+    {
+        Event = @event;
+        Completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+    }
+
+    public Event Event { get; }
+    public TaskCompletionSource<bool> Completion { get; }
+}
+
+public class Queue
+{
+    private readonly System.Collections.Generic.Queue<PendingEvent> _regularQueue = new();
+    private readonly Stack<PendingEvent> _priorityQueue = new();
+
+    internal virtual void Push(Context context, PendingEvent pending)
+    {
+        if (pending.Event.Kind.IsCompletionPriority())
+        {
+            _priorityQueue.Push(pending);
+        }
+        else
+        {
+            _regularQueue.Enqueue(pending);
+        }
+    }
+
+    internal virtual PendingEvent? Pop(Context context)
+    {
+        if (_priorityQueue.Count > 0)
+        {
+            return _priorityQueue.Pop();
+        }
+
+        return _regularQueue.Count == 0 ? null : _regularQueue.Dequeue();
+    }
+
+    internal virtual int Len(Context context) => _regularQueue.Count + _priorityQueue.Count;
+
+    internal virtual void Clear()
+    {
+        _regularQueue.Clear();
+        _priorityQueue.Clear();
+    }
 }
 
 public abstract class Instance : IInstance
@@ -421,18 +470,6 @@ internal static class Runtime
 
 internal sealed class RuntimeEngine
 {
-    private sealed class PendingEvent
-    {
-        public PendingEvent(Event @event)
-        {
-            Event = @event;
-            Completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-        }
-
-        public Event Event { get; }
-        public TaskCompletionSource<bool> Completion { get; }
-    }
-
     private sealed class StateScope
     {
         public StateScope(CancellationTokenSource cancellation)
@@ -454,8 +491,7 @@ internal sealed class RuntimeEngine
     }
 
     private readonly object _gate = new();
-    private readonly Queue<PendingEvent> _regularQueue = new();
-    private readonly Stack<PendingEvent> _priorityQueue = new();
+    private readonly Queue _queue;
     private readonly List<PendingEvent> _deferred = new();
     private readonly Dictionary<string, object?> _attributes = new(StringComparer.Ordinal);
     private readonly Dictionary<string, StateScope> _activeScopes = new(StringComparer.Ordinal);
@@ -476,6 +512,7 @@ internal sealed class RuntimeEngine
         _instance = instance;
         _model = model;
         _config = config;
+        _queue = config.Queue ?? new Queue();
         _currentState = model;
 
         QualifiedName = string.IsNullOrWhiteSpace(config.Name)
@@ -526,7 +563,7 @@ internal sealed class RuntimeEngine
         lock (_gate)
         {
             pending = new PendingEvent(@event);
-            Enqueue(pending);
+            _queue.Push(Context, pending);
             Notify(_observers?.Dispatched, @event.Name);
             if (_processing)
             {
@@ -580,8 +617,7 @@ internal sealed class RuntimeEngine
         {
             ExitToAncestor(_currentState.QualifiedName, _model.QualifiedName, new CompletionEvent("hsm.final"));
             CancelScopes();
-            _regularQueue.Clear();
-            _priorityQueue.Clear();
+            _queue.Clear();
             _deferred.Clear();
             _historyShallow.Clear();
             _historyDeep.Clear();
@@ -654,7 +690,7 @@ internal sealed class RuntimeEngine
         lock (_gate)
         {
             attributes = new Dictionary<string, object?>(_attributes, StringComparer.Ordinal);
-            queueLen = _regularQueue.Count + _priorityQueue.Count + _deferred.Count;
+            queueLen = _queue.Len(Context) + _deferred.Count;
             currentState = _currentState.QualifiedName;
         }
 
@@ -751,33 +787,6 @@ internal sealed class RuntimeEngine
         _activeScopes.Clear();
     }
 
-    private void Enqueue(PendingEvent pending)
-    {
-        if (pending.Event.Kind.IsCompletionPriority())
-        {
-            _priorityQueue.Push(pending);
-        }
-        else
-        {
-            _regularQueue.Enqueue(pending);
-        }
-    }
-
-    private PendingEvent? Dequeue()
-    {
-        if (_priorityQueue.Count > 0)
-        {
-            return _priorityQueue.Pop();
-        }
-
-        if (_regularQueue.Count == 0)
-        {
-            return null;
-        }
-
-        return _regularQueue.Dequeue();
-    }
-
     private void ProcessQueueWorker()
     {
         try
@@ -792,7 +801,7 @@ internal sealed class RuntimeEngine
                 PendingEvent? pending;
                 lock (_gate)
                 {
-                    pending = Dequeue();
+                    pending = _queue.Pop(Context);
                     if (pending is null)
                     {
                         var completion = _processingCompletion;
@@ -839,7 +848,7 @@ internal sealed class RuntimeEngine
         {
             for (var index = 0; index < _deferred.Count; index++)
             {
-                _regularQueue.Enqueue(_deferred[index]);
+                _queue.Push(Context, _deferred[index]);
             }
 
             _deferred.Clear();
