@@ -136,14 +136,24 @@ internal sealed class PendingEvent
 
 public class Queue
 {
+    private readonly Queue? _regularQueueOverride;
     private readonly System.Collections.Generic.Queue<PendingEvent> _regularQueue = new();
     private readonly Stack<PendingEvent> _priorityQueue = new();
+
+    public Queue(Queue? regularQueue = null)
+    {
+        _regularQueueOverride = regularQueue;
+    }
 
     internal virtual void Push(Context context, PendingEvent pending)
     {
         if (pending.Event.Kind.IsCompletionPriority())
         {
             _priorityQueue.Push(pending);
+        }
+        else if (_regularQueueOverride is not null)
+        {
+            _regularQueueOverride.Push(context, pending);
         }
         else
         {
@@ -158,14 +168,21 @@ public class Queue
             return _priorityQueue.Pop();
         }
 
+        if (_regularQueueOverride is not null)
+        {
+            return _regularQueueOverride.Pop(context);
+        }
+
         return _regularQueue.Count == 0 ? null : _regularQueue.Dequeue();
     }
 
-    internal virtual int Len(Context context) => _regularQueue.Count + _priorityQueue.Count;
+    internal virtual int Len(Context context) =>
+        _priorityQueue.Count + (_regularQueueOverride?.Len(context) ?? _regularQueue.Count);
 
     internal virtual void Clear()
     {
         _regularQueue.Clear();
+        _regularQueueOverride?.Clear();
         _priorityQueue.Clear();
     }
 }
@@ -512,7 +529,7 @@ internal sealed class RuntimeEngine
         _instance = instance;
         _model = model;
         _config = config;
-        _queue = config.Queue ?? new Queue();
+        _queue = new Queue(config.Queue);
         _currentState = model;
 
         QualifiedName = string.IsNullOrWhiteSpace(config.Name)
