@@ -4,6 +4,11 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <LangVersion>latest</LangVersion>
+    <Version>1.0.1</Version>
+    <PackageVersion>1.0.1</PackageVersion>
+    <Description>Hierarchical State Machine runtime and DSL for C#.</Description>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <RepositoryUrl>https://github.com/stateforward/hsm.cs</RepositoryUrl>
     <RootNamespace>Stateforward.Hsm</RootNamespace>
     <AssemblyName>Stateforward.Hsm</AssemblyName>
   </PropertyGroup>
