@@ -145,27 +145,29 @@ public class Queue
         _regularQueueOverride = regularQueue;
     }
 
-    internal virtual void Push(Context context, PendingEvent pending)
+    internal virtual Exception? Push(Context context, PendingEvent pending)
     {
         if (pending.Event.Kind.IsCompletionPriority())
         {
             _priorityQueue.Push(pending);
+            return null;
         }
         else if (_regularQueueOverride is not null)
         {
-            _regularQueueOverride.Push(context, pending);
+            return _regularQueueOverride.Push(context, pending);
         }
         else
         {
             _regularQueue.Enqueue(pending);
+            return null;
         }
     }
 
-    internal virtual PendingEvent? Pop(Context context)
+    internal virtual (PendingEvent? Pending, Exception? Error) Pop(Context context)
     {
         if (_priorityQueue.Count > 0)
         {
-            return _priorityQueue.Pop();
+            return (_priorityQueue.Pop(), null);
         }
 
         if (_regularQueueOverride is not null)
@@ -173,11 +175,19 @@ public class Queue
             return _regularQueueOverride.Pop(context);
         }
 
-        return _regularQueue.Count == 0 ? null : _regularQueue.Dequeue();
+        return (_regularQueue.Count == 0 ? null : _regularQueue.Dequeue(), null);
     }
 
-    internal virtual int Len(Context context) =>
-        _priorityQueue.Count + (_regularQueueOverride?.Len(context) ?? _regularQueue.Count);
+    internal virtual (int Count, Exception? Error) Len(Context context)
+    {
+        if (_regularQueueOverride is null)
+        {
+            return (_priorityQueue.Count + _regularQueue.Count, null);
+        }
+
+        var (count, error) = _regularQueueOverride.Len(context);
+        return (_priorityQueue.Count + count, error);
+    }
 
     internal virtual void Clear()
     {
@@ -580,7 +590,11 @@ internal sealed class RuntimeEngine
         lock (_gate)
         {
             pending = new PendingEvent(@event);
-            _queue.Push(Context, pending);
+            var error = _queue.Push(Context, pending);
+            if (error is not null && !@event.Kind.IsCompletionPriority())
+            {
+                _queue.Push(Context, new PendingEvent(new ErrorEvent(error)));
+            }
             Notify(_observers?.Dispatched, @event.Name);
             if (_processing)
             {
@@ -707,7 +721,8 @@ internal sealed class RuntimeEngine
         lock (_gate)
         {
             attributes = new Dictionary<string, object?>(_attributes, StringComparer.Ordinal);
-            queueLen = _queue.Len(Context) + _deferred.Count;
+            var (count, _) = _queue.Len(Context);
+            queueLen = count + _deferred.Count;
             currentState = _currentState.QualifiedName;
         }
 
@@ -818,7 +833,14 @@ internal sealed class RuntimeEngine
                 PendingEvent? pending;
                 lock (_gate)
                 {
-                    pending = _queue.Pop(Context);
+                    var (nextPending, error) = _queue.Pop(Context);
+                    if (error is not null)
+                    {
+                        _queue.Push(Context, new PendingEvent(new ErrorEvent(error)));
+                        continue;
+                    }
+
+                    pending = nextPending;
                     if (pending is null)
                     {
                         var completion = _processingCompletion;
@@ -865,7 +887,11 @@ internal sealed class RuntimeEngine
         {
             for (var index = 0; index < _deferred.Count; index++)
             {
-                _queue.Push(Context, _deferred[index]);
+                var error = _queue.Push(Context, _deferred[index]);
+                if (error is not null)
+                {
+                    _queue.Push(Context, new PendingEvent(new ErrorEvent(error)));
+                }
             }
 
             _deferred.Clear();
