@@ -23,6 +23,10 @@ public delegate Task ConditionChannel<in TInstance>(
 
 public static class Hsm
 {
+    public static ulong MakeKind(params ulong[] bases) => KindUtility.MakeKind(bases);
+    public static bool IsKind(ulong kind, params ulong[] bases) => KindUtility.IsKind(kind, bases);
+    public static bool IsKind(Kind kind, params Kind[] bases) => KindUtility.IsKind(kind, bases);
+
     public static Clock DefaultClock
     {
         get => Runtime.DefaultClock;
@@ -43,9 +47,13 @@ public static class Hsm
     public static IPartial On(Event @event) => Dsl.On(@event);
     public static IPartial OnCall(string operationName) => Dsl.OnCall(operationName);
     public static IPartial OnSet(string attributeName) => Dsl.OnSet(attributeName);
+    public static IPartial When(string attributeName) => Dsl.When(attributeName);
     public static IPartial When<TInstance>(ConditionChannel<TInstance> condition) where TInstance : Instance => Dsl.When(condition);
+    public static IPartial After(string attributeName) => Dsl.After(attributeName);
     public static IPartial After<TInstance>(DurationProvider<TInstance> duration) where TInstance : Instance => Dsl.After(duration);
+    public static IPartial At(string attributeName) => Dsl.At(attributeName);
     public static IPartial At<TInstance>(TimeProvider<TInstance> time) where TInstance : Instance => Dsl.At(time);
+    public static IPartial Every(string attributeName) => Dsl.Every(attributeName);
     public static IPartial Every<TInstance>(DurationProvider<TInstance> duration) where TInstance : Instance => Dsl.Every(duration);
     public static IPartial Entry<TInstance>(params Operation<TInstance>[] ops) where TInstance : Instance => Dsl.Entry(ops);
     public static IPartial Exit<TInstance>(params Operation<TInstance>[] ops) where TInstance : Instance => Dsl.Exit(ops);
@@ -55,6 +63,8 @@ public static class Hsm
     public static IPartial Defer(params string[] eventNames) => Dsl.Defer(eventNames);
     public static IPartial Attribute<T>(string name, T? defaultValue = default) => Dsl.Attribute(name, defaultValue);
     public static IPartial Operation(string name, Delegate callback) => Dsl.Operation(name, callback);
+    public static Group MakeGroup(params IInstance[] instances) => new(instances);
+    public static Group MakeGroup(string groupId, params IInstance[] instances) => new(groupId, instances);
 
     public static TInstance New<TInstance>(TInstance instance, Model model, Config? config = null)
         where TInstance : Instance => Runtime.New(instance, model, config);
@@ -69,10 +79,13 @@ public static class Hsm
         where TInstance : Instance => Runtime.Started(context, instance, model, config);
 
     public static Task Dispatch(Context context, IInstance? instance, Event @event) => Runtime.Dispatch(context, instance, @event);
+
     public static Task Stop(Context context, IInstance instance) => Runtime.Stop(context, instance);
     public static Task Restart(Context context, IInstance instance, object? data = null) => Runtime.Restart(context, instance, data);
     public static Task DispatchAll(Context context, Event @event) => Runtime.DispatchAll(context, @event);
+
     public static Task DispatchTo(Context context, Event @event, params string[] idPatterns) => Runtime.DispatchTo(context, @event, idPatterns);
+
     public static T? Get<T>(Context context, IInstance? instance, string attributeName) => Runtime.Get<T>(context, instance, attributeName);
     public static Task Set(Context context, IInstance? instance, string attributeName, object? value) => Runtime.Set(context, instance, attributeName, value);
     public static object? Call(Context context, IInstance? instance, string operationName, params object?[] args) => Runtime.Call(context, instance, operationName, args);

@@ -12,6 +12,77 @@ public sealed class ParityApiTests
     }
 
     [Fact]
+    public void MakeKindAndIsKindSupportCanonicalKindInheritance()
+    {
+        var baseKind = Hsm.MakeKind();
+        var secondBase = Hsm.MakeKind();
+        var derived = Hsm.MakeKind(baseKind, secondBase);
+        var leaf = Hsm.MakeKind(derived);
+
+        Assert.True(Hsm.IsKind(derived, baseKind));
+        Assert.True(Hsm.IsKind(derived, secondBase));
+        Assert.True(Hsm.IsKind(leaf, derived));
+        Assert.True(Hsm.IsKind(leaf, baseKind));
+        Assert.False(Hsm.IsKind(baseKind, derived));
+
+        Assert.True(Hsm.IsKind(Kind.FinalState, Kind.State));
+        Assert.True(Hsm.IsKind(Kind.FinalState, Kind.Vertex));
+        Assert.True(Hsm.IsKind(Kind.FinalState, Kind.Element));
+        Assert.True(Hsm.IsKind(Kind.ErrorEvent, Kind.CompletionEvent));
+        Assert.True(Hsm.IsKind(Kind.ErrorEvent, Kind.Event));
+        Assert.False(Hsm.IsKind(Kind.State, Kind.FinalState));
+    }
+
+    [Fact]
+    public void ConfigIDAliasMatchesExistingIdProperty()
+    {
+        var idConfig = new Config { Id = "existing-id" };
+        var aliasConfig = new Config { ID = "alias-id" };
+
+        Assert.Equal("existing-id", idConfig.Id);
+        Assert.Equal("existing-id", idConfig.ID);
+        Assert.Equal("alias-id", aliasConfig.Id);
+        Assert.Equal("alias-id", aliasConfig.ID);
+
+        var model = Hsm.Define(
+            "ConfigIDAlias",
+            Hsm.Initial(Hsm.Target("idle")),
+            Hsm.State("idle"));
+
+        var machine = Hsm.Start(new Context(), new TestMachine(), model, aliasConfig);
+
+        Assert.Equal("alias-id", Hsm.ID(machine));
+    }
+
+    [Fact]
+    public async Task MakeGroupCreatesCanonicalGroupsAndSupportsExplicitID()
+    {
+        var model = Hsm.Define(
+            "MakeGroupParity",
+            Hsm.Initial(Hsm.Target("idle")),
+            Hsm.State("idle", Hsm.Transition(Hsm.On("go"), Hsm.Target("../done"))),
+            Hsm.State("done"));
+
+        var context = new Context();
+        var alpha = Hsm.Start(context, new TestMachine(), model, new Config { Id = "alpha" });
+        var bravo = Hsm.Start(context, new TestMachine(), model, new Config { Id = "bravo" });
+
+        var nested = Hsm.MakeGroup(Hsm.MakeGroup(alpha), bravo);
+        Assert.Equal(new[] { alpha, bravo }, nested.Instances);
+        Assert.StartsWith("group_", Hsm.ID(Hsm.MakeGroup(alpha)));
+
+        var identified = Hsm.MakeGroup("fleet", nested);
+        Assert.Equal("fleet", Hsm.ID(identified));
+        Assert.Equal("fleet", Hsm.TakeSnapshot(context, identified).ID);
+
+        await identified.Dispatch(new Event("go"));
+        Assert.Equal("/MakeGroupParity/done", alpha.State);
+        Assert.Equal("/MakeGroupParity/done", bravo.State);
+
+        Assert.Throws<ValidationException>(() => Hsm.MakeGroup("", alpha));
+    }
+
+    [Fact]
     public async Task DispatchFallbackAndTargetedDispatchUseContextAndIdPatterns()
     {
         var model = Hsm.Define(
@@ -41,6 +112,31 @@ public sealed class ParityApiTests
         Assert.True(Hsm.Match("charlie", "*lie"));
         Assert.True(Hsm.Match("/DispatchParity/idle", "*/idle"));
         Assert.False(Hsm.Match("bravo", "a*", "*lie"));
+    }
+
+    [Fact]
+    public async Task DispatchCompletesWhenCurrentStateDefersEvent()
+    {
+        var model = Hsm.Define(
+            "DeferredDispatchCompletionParity",
+            Hsm.Initial(Hsm.Target("holding")),
+            Hsm.State(
+                "holding",
+                Hsm.Defer("wait"),
+                Hsm.Transition(Hsm.On("release"), Hsm.Target("../ready"))),
+            Hsm.State(
+                "ready",
+                Hsm.Transition(Hsm.On("wait"), Hsm.Target("../done"))),
+            Hsm.State("done"));
+
+        var context = new Context();
+        var machine = Hsm.Start(context, new TestMachine(), model);
+
+        await Hsm.Dispatch(context, machine, new Event("wait"));
+        Assert.Equal("/DeferredDispatchCompletionParity/holding", machine.State);
+
+        await Hsm.Dispatch(context, machine, new Event("release"));
+        Assert.Equal("/DeferredDispatchCompletionParity/done", machine.State);
     }
 
     [Fact]
@@ -104,6 +200,74 @@ public sealed class ParityApiTests
 
         Assert.Equal("/ImplicitAttributeParity/done", machine.State);
         Assert.Equal(42, Hsm.Get<int>(context, machine, "config/value"));
+    }
+
+    [Fact]
+    public async Task WhenStringIsCanonicalOnSetAlias()
+    {
+        var model = Hsm.Define(
+            "WhenAttributeAliasParity",
+            Hsm.Attribute("flag", false),
+            Hsm.Initial(Hsm.Target("idle")),
+            Hsm.State(
+                "idle",
+                Hsm.Transition(Hsm.When("flag"), Hsm.Target("../changed"))),
+            Hsm.State("changed"));
+
+        var context = new Context();
+        var machine = Hsm.Start(context, new TestMachine(), model);
+
+        await Hsm.Set(context, machine, "flag", true);
+
+        Assert.Equal("/WhenAttributeAliasParity/changed", machine.State);
+        Assert.True(Hsm.Get<bool>(context, machine, "flag"));
+    }
+
+    [Fact]
+    public async Task SetCompletesForDeclaredAttributeUpdatesAndUnchangedValues()
+    {
+        var model = Hsm.Define(
+            "SetProcessedParity",
+            Hsm.Attribute("count", 0),
+            Hsm.Initial(Hsm.Target("idle")),
+            Hsm.State(
+                "idle",
+                Hsm.Transition(Hsm.OnSet("count"), Hsm.Target("../updated"))),
+            Hsm.State("updated"));
+
+        var context = new Context();
+        var machine = Hsm.Start(context, new TestMachine(), model);
+
+        await Hsm.Set(context, machine, "count", 0);
+        Assert.Equal("/SetProcessedParity/idle", machine.State);
+
+        await Hsm.Set(context, machine, "count", 1);
+        Assert.Equal("/SetProcessedParity/updated", machine.State);
+        Assert.Equal(1, Hsm.Get<int>(context, machine, "count"));
+    }
+
+    [Fact]
+    public async Task SetIgnoresUnknownAttributesAndExactTypeMismatches()
+    {
+        var model = Hsm.Define(
+            "SetRejectedParity",
+            Hsm.Attribute("count", 0),
+            Hsm.Initial(Hsm.Target("idle")),
+            Hsm.State(
+                "idle",
+                Hsm.Transition(Hsm.OnSet("count"), Hsm.Target("../updated"))),
+            Hsm.State("updated"));
+
+        var context = new Context();
+        var machine = Hsm.Start(context, new TestMachine(), model);
+
+        await Hsm.Set(context, machine, "missing", 1);
+        Assert.Equal("/SetRejectedParity/idle", machine.State);
+        Assert.Equal(0, Hsm.Get<int>(context, machine, "count"));
+
+        await Hsm.Set(context, machine, "count", 1L);
+        Assert.Equal("/SetRejectedParity/idle", machine.State);
+        Assert.Equal(0, Hsm.Get<int>(context, machine, "count"));
     }
 
     [Fact]

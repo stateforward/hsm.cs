@@ -1,3 +1,4 @@
+using System.Collections.ObjectModel;
 using System.Globalization;
 using System.Threading;
 
@@ -74,33 +75,49 @@ public abstract class NamedElement : Element
 public class Event
 {
     public const string AnyName = "*";
+    private string _name;
 
-    public Event(string name, Kind kind = Kind.Event, object? data = null, string? source = null, string? id = null, string? target = null, object? schema = null)
+    public Event(string name, Kind kind = Kind.Event, object? data = null, string? source = null, string? id = null, string? target = null, object? schema = null, string? qualifiedName = null)
     {
         if (string.IsNullOrWhiteSpace(name))
         {
             throw new ValidationException("event name cannot be empty");
         }
 
-        Name = name;
+        _name = name;
         Kind = kind;
         Data = data;
         Source = source;
         ID = id ?? string.Empty;
         Target = target;
         Schema = schema;
+        QualifiedName = qualifiedName;
     }
 
-    public string Name { get; }
-    public Kind Kind { get; init; }
-    public string ID { get; init; }
-    public object? Data { get; init; }
-    public string? Source { get; init; }
-    public string? Target { get; init; }
-    public object? Schema { get; init; }
+    public string Name
+    {
+        get => _name;
+        set
+        {
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                throw new ValidationException("event name cannot be empty");
+            }
 
-    public Event WithData(object? data) => new(Name, Kind, data, Source, ID, Target, Schema);
-    public Event WithDataAndID(object? data, string id) => new(Name, Kind, data, null, id, null, Schema);
+            _name = value;
+        }
+    }
+
+    public string? QualifiedName { get; set; }
+    public Kind Kind { get; set; }
+    public string ID { get; set; }
+    public object? Data { get; init; }
+    public string? Source { get; set; }
+    public string? Target { get; set; }
+    public object? Schema { get; set; }
+
+    public Event WithData(object? data) => new(Name, Kind, data, Source, ID, Target, Schema, QualifiedName);
+    public Event WithDataAndID(object? data, string id) => new(Name, Kind, data, null, id, null, Schema, QualifiedName);
 }
 
 public class CompletionEvent : Event
@@ -156,7 +173,8 @@ public sealed class Snapshot
     public string ID { get; init; } = string.Empty;
     public string QualifiedName { get; init; } = string.Empty;
     public string State { get; init; } = string.Empty;
-    public IReadOnlyDictionary<string, object?> Attributes { get; init; } = new Dictionary<string, object?>();
+    public IReadOnlyDictionary<string, object?> Attributes { get; init; } =
+        new ReadOnlyDictionary<string, object?>(new Dictionary<string, object?>());
     public int QueueLen { get; init; }
     public IReadOnlyList<EventSnapshot> Events { get; init; } = Array.Empty<EventSnapshot>();
 }

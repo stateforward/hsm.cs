@@ -118,6 +118,69 @@ public sealed class TimerAndActivityTests
     }
 
     [Fact]
+    public async Task AttributeSourcesDriveAfterEveryAndAtTransitions()
+    {
+        var afterHarness = new TestClockHarness();
+        var afterModel = Hsm.Define(
+            "AfterAttributeRules",
+            Hsm.Attribute("delay", TimeSpan.FromMinutes(3)),
+            Hsm.Initial(Hsm.Target("waiting")),
+            Hsm.State(
+                "waiting",
+                Hsm.Transition(
+                    Hsm.After("delay"),
+                    Hsm.Target("../done"))),
+            Hsm.State("done"));
+
+        var afterMachine = Hsm.Start(new Context(), new TestMachine(), afterModel, new Config { Clock = afterHarness.Clock });
+        var afterPending = await afterHarness.NextAsync("attribute after");
+        Assert.Equal(TimeSpan.FromMinutes(3), afterPending.Duration);
+        afterPending.Trigger();
+        await WaitUntilAsync(() => afterMachine.State == "/AfterAttributeRules/done", "attribute after transition");
+        Assert.Equal("/AfterAttributeRules/done", afterMachine.State);
+
+        var everyHarness = new TestClockHarness();
+        var everyModel = Hsm.Define(
+            "EveryAttributeRules",
+            Hsm.Attribute("interval", TimeSpan.FromMinutes(4)),
+            Hsm.Initial(Hsm.Target("waiting")),
+            Hsm.State(
+                "waiting",
+                Hsm.Transition(
+                    Hsm.Every("interval"),
+                    Hsm.Target("../done"))),
+            Hsm.State("done"));
+
+        var everyMachine = Hsm.Start(new Context(), new TestMachine(), everyModel, new Config { Clock = everyHarness.Clock });
+        var everyPending = await everyHarness.NextAsync("attribute every");
+        Assert.Equal(TimeSpan.FromMinutes(4), everyPending.Duration);
+        everyPending.Trigger();
+        await WaitUntilAsync(() => everyMachine.State == "/EveryAttributeRules/done", "attribute every transition");
+        Assert.Equal("/EveryAttributeRules/done", everyMachine.State);
+
+        var now = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
+        var atHarness = new TestClockHarness(now);
+        var deadline = now.AddMinutes(5);
+        var atModel = Hsm.Define(
+            "AtAttributeRules",
+            Hsm.Attribute("deadline", deadline),
+            Hsm.Initial(Hsm.Target("waiting")),
+            Hsm.State(
+                "waiting",
+                Hsm.Transition(
+                    Hsm.At("deadline"),
+                    Hsm.Target("../done"))),
+            Hsm.State("done"));
+
+        var atMachine = Hsm.Start(new Context(), new TestMachine(), atModel, new Config { Clock = atHarness.Clock });
+        var atPending = await atHarness.NextAsync("attribute at");
+        Assert.Equal(TimeSpan.FromMinutes(5), atPending.Duration);
+        atPending.Trigger();
+        await WaitUntilAsync(() => atMachine.State == "/AtAttributeRules/done", "attribute at transition");
+        Assert.Equal("/AtAttributeRules/done", atMachine.State);
+    }
+
+    [Fact]
     public async Task ActivityIsCanceledOnExit()
     {
         var started = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);

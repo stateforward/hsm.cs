@@ -1,3 +1,4 @@
+using System.Collections.ObjectModel;
 using System.Reflection;
 using System.Threading;
 
@@ -94,27 +95,59 @@ public class Clock
     public Clock(
         Func<TimeSpan, CancellationToken, Task>? delayAsync = null,
         Func<DateTimeOffset>? utcNow = null)
+        : this(true, delayAsync, utcNow)
     {
+    }
+
+    private Clock(
+        bool inheritDefault,
+        Func<TimeSpan, CancellationToken, Task>? delayAsync = null,
+        Func<DateTimeOffset>? utcNow = null)
+    {
+        _inheritDefault = inheritDefault;
         DelayAsync = delayAsync;
         UtcNow = utcNow;
     }
 
-    public static Clock System { get; } = new();
+    private readonly bool _inheritDefault;
+
+    public static Clock System { get; } = new(false);
     public Func<TimeSpan, CancellationToken, Task>? DelayAsync { get; init; }
     public Func<DateTimeOffset>? UtcNow { get; init; }
 
     internal Task Delay(TimeSpan due, CancellationToken cancellationToken)
     {
         var normalized = due < TimeSpan.Zero ? TimeSpan.Zero : due;
-        return (DelayAsync ?? Task.Delay)(normalized, cancellationToken);
+        var delayAsync = DelayAsync;
+        if (delayAsync is null && _inheritDefault && !ReferenceEquals(this, Runtime.DefaultClock))
+        {
+            delayAsync = Runtime.DefaultClock.DelayAsync;
+        }
+
+        return (delayAsync ?? Task.Delay)(normalized, cancellationToken);
     }
 
-    internal DateTimeOffset Now() => (UtcNow ?? (() => DateTimeOffset.UtcNow))();
+    internal DateTimeOffset Now()
+    {
+        var utcNow = UtcNow;
+        if (utcNow is null && _inheritDefault && !ReferenceEquals(this, Runtime.DefaultClock))
+        {
+            utcNow = Runtime.DefaultClock.UtcNow;
+        }
+
+        return (utcNow ?? (() => DateTimeOffset.UtcNow))();
+    }
 }
 
 public sealed class Config
 {
     public string? Id { get; init; }
+    public string? ID
+    {
+        get => Id;
+        init => Id = value;
+    }
+
     public string? Name { get; init; }
     public object? Data { get; init; }
     public TimeSpan ActivityTimeout { get; init; } = TimeSpan.FromMilliseconds(1);
@@ -139,10 +172,28 @@ public class Queue
     private readonly Queue? _regularQueueOverride;
     private readonly System.Collections.Generic.Queue<PendingEvent> _regularQueue = new();
     private readonly Stack<PendingEvent> _priorityQueue = new();
+    private readonly Func<Context, Event, Exception?>? _pushHook;
+    private readonly Func<Context, (Event? Event, Exception? Error)>? _popHook;
+    private readonly Func<Context, (int Count, Exception? Error)>? _lenHook;
+    private readonly Action? _clearHook;
+    private readonly Dictionary<Event, System.Collections.Generic.Queue<PendingEvent>>? _pendingByEvent;
 
     public Queue(Queue? regularQueue = null)
     {
         _regularQueueOverride = regularQueue;
+    }
+
+    public Queue(
+        Func<Context, Event, Exception?> push,
+        Func<Context, (Event? Event, Exception? Error)> pop,
+        Func<Context, (int Count, Exception? Error)> len,
+        Action? clear = null)
+    {
+        _pushHook = push ?? throw new ArgumentNullException(nameof(push));
+        _popHook = pop ?? throw new ArgumentNullException(nameof(pop));
+        _lenHook = len ?? throw new ArgumentNullException(nameof(len));
+        _clearHook = clear;
+        _pendingByEvent = new Dictionary<Event, System.Collections.Generic.Queue<PendingEvent>>(ReferenceEqualityComparer.Instance);
     }
 
     internal virtual Exception? Push(Context context, PendingEvent pending)
@@ -155,6 +206,23 @@ public class Queue
         else if (_regularQueueOverride is not null)
         {
             return _regularQueueOverride.Push(context, pending);
+        }
+        else if (_pushHook is not null)
+        {
+            try
+            {
+                var error = _pushHook(context, pending.Event);
+                if (error is null)
+                {
+                    RememberPending(pending);
+                }
+
+                return error;
+            }
+            catch (Exception error)
+            {
+                return error;
+            }
         }
         else
         {
@@ -175,17 +243,37 @@ public class Queue
             return _regularQueueOverride.Pop(context);
         }
 
+        if (_popHook is not null)
+        {
+            try
+            {
+                var (eventFromQueue, error) = _popHook(context);
+                if (error is not null || eventFromQueue is null)
+                {
+                    return (null, error);
+                }
+
+                return (TakePending(eventFromQueue) ?? new PendingEvent(eventFromQueue), null);
+            }
+            catch (Exception error)
+            {
+                return (null, error);
+            }
+        }
+
         return (_regularQueue.Count == 0 ? null : _regularQueue.Dequeue(), null);
     }
 
     internal virtual (int Count, Exception? Error) Len(Context context)
     {
-        if (_regularQueueOverride is null)
+        if (_regularQueueOverride is null && _lenHook is null)
         {
             return (_priorityQueue.Count + _regularQueue.Count, null);
         }
 
-        var (count, error) = _regularQueueOverride.Len(context);
+        var (count, error) = _regularQueueOverride is not null
+            ? _regularQueueOverride.Len(context)
+            : SafeLen(context);
         return (_priorityQueue.Count + count, error);
     }
 
@@ -193,7 +281,53 @@ public class Queue
     {
         _regularQueue.Clear();
         _regularQueueOverride?.Clear();
+        _pendingByEvent?.Clear();
+        _clearHook?.Invoke();
         _priorityQueue.Clear();
+    }
+
+    private void RememberPending(PendingEvent pending)
+    {
+        if (_pendingByEvent is null)
+        {
+            return;
+        }
+
+        if (!_pendingByEvent.TryGetValue(pending.Event, out var waiters))
+        {
+            waiters = new System.Collections.Generic.Queue<PendingEvent>();
+            _pendingByEvent.Add(pending.Event, waiters);
+        }
+
+        waiters.Enqueue(pending);
+    }
+
+    private PendingEvent? TakePending(Event @event)
+    {
+        if (_pendingByEvent is null || !_pendingByEvent.TryGetValue(@event, out var waiters))
+        {
+            return null;
+        }
+
+        var pending = waiters.Dequeue();
+        if (waiters.Count == 0)
+        {
+            _pendingByEvent.Remove(@event);
+        }
+
+        return pending;
+    }
+
+    private (int Count, Exception? Error) SafeLen(Context context)
+    {
+        try
+        {
+            return _lenHook!(context);
+        }
+        catch (Exception error)
+        {
+            return (0, error);
+        }
     }
 }
 
@@ -205,6 +339,7 @@ public abstract class Instance : IInstance
     public virtual string State => Engine?.State ?? string.Empty;
     public virtual Context Context => Engine?.Context ?? (_detachedContext ??= new Context());
     public virtual Task Dispatch(Event @event) => Engine?.Dispatch(@event) ?? Task.CompletedTask;
+
     public virtual Task Stop() => Engine?.StopAsync() ?? Task.CompletedTask;
     public virtual Task Restart(object? data = null) => Engine?.RestartAsync(data) ?? Task.CompletedTask;
 }
@@ -213,14 +348,28 @@ public sealed class Group : Instance
 {
     private readonly IReadOnlyList<IInstance> _instances;
     private readonly Context _context;
-    private readonly string _id = $"group_{Guid.NewGuid():N}";
+    private readonly string _id;
 
-    public Group(params IInstance[] instances) : this((IEnumerable<IInstance>)instances)
+    public Group(params IInstance[] instances) : this(CreateGroupId(), instances)
     {
     }
 
-    public Group(IEnumerable<IInstance> instances)
+    public Group(IEnumerable<IInstance> instances) : this(CreateGroupId(), instances)
     {
+    }
+
+    public Group(string groupId, params IInstance[] instances) : this(groupId, (IEnumerable<IInstance>)instances)
+    {
+    }
+
+    public Group(string groupId, IEnumerable<IInstance> instances)
+    {
+        if (string.IsNullOrWhiteSpace(groupId))
+        {
+            throw new ValidationException("group id cannot be empty");
+        }
+
+        _id = groupId;
         var flattened = new List<IInstance>();
         foreach (var instance in instances)
         {
@@ -245,6 +394,7 @@ public sealed class Group : Instance
     public override string State => string.Empty;
     public override Context Context => _context;
     public override Task Dispatch(Event @event) => Task.WhenAll(_instances.Select(instance => instance.Dispatch(@event)));
+
     public override Task Stop() => Task.WhenAll(_instances.Select(instance => instance.Stop()));
     public override Task Restart(object? data = null) => Task.WhenAll(_instances.Select(instance => instance.Restart(data)));
 
@@ -253,15 +403,201 @@ public sealed class Group : Instance
         ID = _id,
         QualifiedName = string.Empty,
         State = string.Empty,
-        Attributes = new Dictionary<string, object?>(),
+        Attributes = new ReadOnlyDictionary<string, object?>(new Dictionary<string, object?>()),
         QueueLen = 0,
         Events = Array.Empty<EventSnapshot>()
     };
+
+    private static string CreateGroupId() => $"group_{Guid.NewGuid():N}";
 }
 
 internal static class Runtime
 {
     public static Clock DefaultClock { get; set; } = Clock.System;
+
+    internal static Event CopyEventForDispatch(Event @event) => new(
+        @event.Name,
+        @event.Kind,
+        @event.Data,
+        @event.Source,
+        @event.ID,
+        @event.Target,
+        CopyEventSchema(@event.Schema),
+        @event.QualifiedName);
+
+    private static object? CopyEventSchema(object? schema) => CopyMutableValue(schema);
+
+    internal static object? CopySnapshotValue(object? value) =>
+        CopyValue(value, immutableCollections: true, new Dictionary<object, object?>(ReferenceEqualityComparer.Instance));
+
+    internal static object? CopyMutableValue(object? value) =>
+        CopyValue(value, immutableCollections: false, new Dictionary<object, object?>(ReferenceEqualityComparer.Instance));
+
+    private static object? CopyValue(object? value, bool immutableCollections, Dictionary<object, object?> seen)
+    {
+        if (value is null || IsSnapshotScalar(value))
+        {
+            return value;
+        }
+
+        if (seen.TryGetValue(value, out var existing))
+        {
+            return existing;
+        }
+
+        switch (value)
+        {
+            case Array array:
+                {
+                    var elementType = value.GetType().GetElementType() ?? typeof(object);
+                    var copy = Array.CreateInstance(elementType, array.Length);
+                    seen[value] = copy;
+                    for (var i = 0; i < array.Length; i++)
+                    {
+                        copy.SetValue(CopyValue(array.GetValue(i), immutableCollections, seen), i);
+                    }
+
+                    return immutableCollections
+                        ? Array.AsReadOnly(copy.Cast<object?>().ToArray())
+                        : copy;
+                }
+            case IDictionary<string, object?> typedDictionary:
+                {
+                    var copy = new Dictionary<string, object?>(StringComparer.Ordinal);
+                    seen[value] = copy;
+                    foreach (var (key, item) in typedDictionary)
+                    {
+                        copy[key] = CopyValue(item, immutableCollections, seen);
+                    }
+
+                    return immutableCollections
+                        ? new ReadOnlyDictionary<string, object?>(copy)
+                        : copy;
+                }
+            case System.Collections.IDictionary dictionary:
+                return CopyDictionary(value, dictionary, immutableCollections, seen);
+            case System.Collections.IList list:
+                return CopyList(value, list, immutableCollections, seen);
+            case System.Collections.IEnumerable enumerable when value is not string:
+                return CopyEnumerable(value, enumerable, immutableCollections, seen);
+            case ICloneable cloneable:
+                return cloneable.Clone();
+            default:
+                return value;
+        }
+    }
+
+    private static bool IsSnapshotScalar(object value) =>
+        value is string
+            or Type
+            or Uri
+            or DateTime
+            or DateTimeOffset
+            or TimeSpan
+            or Guid
+            or decimal
+            || value.GetType().IsPrimitive
+            || value.GetType().IsEnum;
+
+    private static object CopyDictionary(
+        object original,
+        System.Collections.IDictionary dictionary,
+        bool immutableCollections,
+        Dictionary<object, object?> seen)
+    {
+        System.Collections.IDictionary copy = TryCreateMutableDictionary(original)
+            ?? new Dictionary<object, object?>();
+        seen[original] = copy;
+
+        foreach (System.Collections.DictionaryEntry entry in dictionary)
+        {
+            if (entry.Key is not null)
+            {
+                copy[entry.Key] = CopyValue(entry.Value, immutableCollections, seen);
+            }
+        }
+
+        return immutableCollections
+            ? new ReadOnlyDictionary<object, object?>(copy
+                .Cast<System.Collections.DictionaryEntry>()
+                .ToDictionary(entry => entry.Key, entry => entry.Value))
+            : copy;
+    }
+
+    private static object CopyList(
+        object original,
+        System.Collections.IList list,
+        bool immutableCollections,
+        Dictionary<object, object?> seen)
+    {
+        System.Collections.IList copy = TryCreateMutableList(original)
+            ?? new System.Collections.ArrayList();
+        seen[original] = copy;
+
+        foreach (var item in list)
+        {
+            copy.Add(CopyValue(item, immutableCollections, seen));
+        }
+
+        return immutableCollections
+            ? new ReadOnlyCollection<object?>(copy.Cast<object?>().ToArray())
+            : copy;
+    }
+
+    private static IReadOnlyList<object?> CopyEnumerable(
+        object original,
+        System.Collections.IEnumerable enumerable,
+        bool immutableCollections,
+        Dictionary<object, object?> seen)
+    {
+        var copy = new List<object?>();
+        seen[original] = copy;
+
+        foreach (var item in enumerable)
+        {
+            copy.Add(CopyValue(item, immutableCollections, seen));
+        }
+
+        return immutableCollections
+            ? copy.AsReadOnly()
+            : copy;
+    }
+
+    private static System.Collections.IDictionary? TryCreateMutableDictionary(object original)
+    {
+        var type = original.GetType();
+        if (type.IsInterface || type.IsAbstract)
+        {
+            return null;
+        }
+
+        try
+        {
+            return Activator.CreateInstance(type) as System.Collections.IDictionary;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static System.Collections.IList? TryCreateMutableList(object original)
+    {
+        var type = original.GetType();
+        if (type.IsInterface || type.IsAbstract || type.IsArray)
+        {
+            return null;
+        }
+
+        try
+        {
+            return Activator.CreateInstance(type) as System.Collections.IList;
+        }
+        catch
+        {
+            return null;
+        }
+    }
 
     public static TInstance New<TInstance>(TInstance instance, Model model, Config? config = null)
         where TInstance : Instance
@@ -343,7 +679,7 @@ internal static class Runtime
         var value = instance switch
         {
             Group group when group.Instances.Count > 0 => Get<object?>(context, group.Instances[0], attributeName),
-            Instance concrete when concrete.Engine is not null => concrete.Engine.GetAttribute(attributeName),
+            Instance concrete when concrete.Engine is not null => Runtime.CopyMutableValue(concrete.Engine.GetAttribute(attributeName)),
             _ => null
         };
 
@@ -355,15 +691,22 @@ internal static class Runtime
         return value is T typed ? typed : default;
     }
 
-    public static Task Set(Context context, IInstance? instance, string attributeName, object? value)
+    public static async Task Set(Context context, IInstance? instance, string attributeName, object? value)
     {
         instance ??= FromContext(context);
-        return instance switch
+        switch (instance)
         {
-            Group group => Task.WhenAll(group.Instances.Select(child => Set(context, child, attributeName, value))),
-            Instance concrete when concrete.Engine is not null => concrete.Engine.SetAttributeAsync(attributeName, value),
-            _ => Task.CompletedTask
-        };
+            case Group group:
+                {
+                    await Task.WhenAll(group.Instances.Select(child => Set(context, child, attributeName, value)));
+                    return;
+                }
+            case Instance concrete when concrete.Engine is not null:
+                await concrete.Engine.SetAttributeAsync(attributeName, value);
+                return;
+            default:
+                return;
+        }
     }
 
     public static object? Call(Context context, IInstance? instance, string operationName, params object?[] args)
@@ -579,6 +922,11 @@ internal sealed class RuntimeEngine
 
     public Task Dispatch(Event @event)
     {
+        return DispatchCore(@event);
+    }
+
+    private Task DispatchCore(Event @event)
+    {
         if (!IsStarted || Context.IsDone)
         {
             return Task.CompletedTask;
@@ -589,12 +937,13 @@ internal sealed class RuntimeEngine
         Task processingTask;
         lock (_gate)
         {
-            pending = new PendingEvent(@event);
+            pending = new PendingEvent(Runtime.CopyEventForDispatch(@event));
             var error = _queue.Push(Context, pending);
             if (error is not null && !@event.Kind.IsCompletionPriority())
             {
                 _queue.Push(Context, new PendingEvent(new ErrorEvent(error)));
             }
+
             Notify(_observers?.Dispatched, @event.Name);
             if (_processing)
             {
@@ -666,7 +1015,7 @@ internal sealed class RuntimeEngine
         return value;
     }
 
-    public Task SetAttributeAsync(string attributeName, object? value)
+    public async Task SetAttributeAsync(string attributeName, object? value)
     {
         if (string.IsNullOrWhiteSpace(attributeName))
         {
@@ -674,10 +1023,24 @@ internal sealed class RuntimeEngine
         }
 
         var qualifiedName = QualifyAttribute(attributeName);
+        if (!IsKnownAttribute(qualifiedName))
+        {
+            return;
+        }
+
+        if (_model.Attributes.TryGetValue(qualifiedName, out var attribute)
+            && attribute.HasDefault
+            && attribute.DefaultValue is not null
+            && value is not null
+            && value.GetType() != attribute.DefaultValue.GetType())
+        {
+            return;
+        }
+
         var hadValue = _attributes.TryGetValue(qualifiedName, out var previous);
         if (hadValue && Equals(previous, value))
         {
-            return Task.CompletedTask;
+            return;
         }
 
         _attributes[qualifiedName] = value;
@@ -687,7 +1050,7 @@ internal sealed class RuntimeEngine
             Old = hadValue ? previous : null,
             New = value
         };
-        return Dispatch(new Event(qualifiedName, Kind.ChangeEvent, change, qualifiedName));
+        await Dispatch(new Event(qualifiedName, Kind.ChangeEvent, change, qualifiedName));
     }
 
     public object? CallOperation(Context context, string operationName, params object?[] args)
@@ -714,13 +1077,16 @@ internal sealed class RuntimeEngine
 
     public Snapshot TakeSnapshot()
     {
-        Dictionary<string, object?> attributes;
+        ReadOnlyDictionary<string, object?> attributes;
         int queueLen;
         string currentState;
 
         lock (_gate)
         {
-            attributes = new Dictionary<string, object?>(_attributes, StringComparer.Ordinal);
+            attributes = new ReadOnlyDictionary<string, object?>(_attributes.ToDictionary(
+                pair => pair.Key,
+                pair => Runtime.CopySnapshotValue(pair.Value),
+                StringComparer.Ordinal));
             var (count, _) = _queue.Len(Context);
             queueLen = count + _deferred.Count;
             currentState = _currentState.QualifiedName;
@@ -744,7 +1110,7 @@ internal sealed class RuntimeEngine
                         Kind = eventDefinition.Kind,
                         Target = transition.TargetQualifiedName,
                         Guard = transition.Guard is not null,
-                        Schema = eventDefinition.Schema
+                        Schema = Runtime.CopySnapshotValue(eventDefinition.Schema)
                     });
                 }
             }
@@ -757,7 +1123,7 @@ internal sealed class RuntimeEngine
             State = currentState,
             Attributes = attributes,
             QueueLen = queueLen,
-            Events = events
+            Events = events.AsReadOnly()
         };
     }
 
@@ -808,6 +1174,17 @@ internal sealed class RuntimeEngine
         }
     }
 
+    private bool IsKnownAttribute(string qualifiedName)
+    {
+        if (_model.Attributes.ContainsKey(qualifiedName))
+        {
+            return true;
+        }
+
+        return _model.Events.TryGetValue(qualifiedName, out var @event)
+               && @event.Kind == Kind.ChangeEvent;
+    }
+
     private void CancelScopes()
     {
         foreach (var scope in _activeScopes.Values)
@@ -852,7 +1229,16 @@ internal sealed class RuntimeEngine
                     }
                 }
 
-                var stateChanged = ProcessEvent(pending);
+                bool stateChanged;
+                try
+                {
+                    stateChanged = ProcessEvent(pending);
+                }
+                catch
+                {
+                    throw;
+                }
+
                 if (pending.Completion.Task.IsCompleted)
                 {
                     Notify(_observers?.Processed, pending.Event.Name);

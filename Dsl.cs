@@ -60,10 +60,17 @@ internal static class Dsl
         new GuardPartial(Wrap(predicate), predicate.Method.Name);
     public static IPartial After<TInstance>(DurationProvider<TInstance> duration) where TInstance : Instance =>
         new TemporalPartial(TemporalKind.After, duration.Method.Name, duration: Wrap(duration));
+    public static IPartial After(string attributeName) =>
+        new TemporalPartial(TemporalKind.After, AttributeTemporalName(attributeName), duration: AttributeDuration(attributeName));
     public static IPartial At<TInstance>(TimeProvider<TInstance> time) where TInstance : Instance =>
         new TemporalPartial(TemporalKind.At, time.Method.Name, time: Wrap(time));
+    public static IPartial At(string attributeName) =>
+        new TemporalPartial(TemporalKind.At, AttributeTemporalName(attributeName), time: AttributeTime(attributeName));
     public static IPartial Every<TInstance>(DurationProvider<TInstance> duration) where TInstance : Instance =>
         new TemporalPartial(TemporalKind.Every, duration.Method.Name, duration: Wrap(duration));
+    public static IPartial Every(string attributeName) =>
+        new TemporalPartial(TemporalKind.Every, AttributeTemporalName(attributeName), duration: AttributeDuration(attributeName));
+    public static IPartial When(string attributeName) => OnSet(attributeName);
     public static IPartial When<TInstance>(ConditionChannel<TInstance> condition) where TInstance : Instance =>
         new TemporalPartial(TemporalKind.When, condition.Method.Name, condition: Wrap(condition));
 
@@ -189,6 +196,33 @@ internal static class Dsl
 
     private static ConditionInvoker Wrap<TInstance>(ConditionChannel<TInstance> condition) where TInstance : Instance =>
         (ctx, instance, @event, cancellationToken) => condition(ctx, (TInstance)instance, @event, cancellationToken);
+
+    private static string AttributeTemporalName(string attributeName)
+    {
+        if (string.IsNullOrWhiteSpace(attributeName))
+        {
+            throw new ValidationException("temporal attribute name cannot be empty");
+        }
+
+        return "attribute_" + attributeName.Replace('/', '_');
+    }
+
+    private static DurationInvoker AttributeDuration(string attributeName) =>
+        (ctx, instance, _) => Runtime.Get<object?>(ctx, instance, attributeName) switch
+        {
+            TimeSpan duration => duration,
+            null => throw new HsmRuntimeException($"attribute '{attributeName}' must be a TimeSpan"),
+            var value => throw new HsmRuntimeException($"attribute '{attributeName}' must be a TimeSpan, got {value.GetType().Name}")
+        };
+
+    private static TimeInvoker AttributeTime(string attributeName) =>
+        (ctx, instance, _) => Runtime.Get<object?>(ctx, instance, attributeName) switch
+        {
+            DateTimeOffset time => time,
+            DateTime time => new DateTimeOffset(time),
+            null => throw new HsmRuntimeException($"attribute '{attributeName}' must be a DateTimeOffset or DateTime"),
+            var value => throw new HsmRuntimeException($"attribute '{attributeName}' must be a DateTimeOffset or DateTime, got {value.GetType().Name}")
+        };
 
     private static void FinalizeTransition(Model model, Transition transition)
     {
