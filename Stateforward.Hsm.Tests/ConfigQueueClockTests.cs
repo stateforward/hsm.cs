@@ -9,6 +9,33 @@ public sealed class ConfigQueueClockTests
     }
 
     [Fact]
+    public void QueueHooksAreSynchronousApi()
+    {
+        Func<Context, Event, Exception?> push = (_, _) => null;
+        Func<Context, (Event? Event, Exception? Error)> pop = _ => (null, null);
+        Func<Context, (int Count, Exception? Error)> len = _ => (0, null);
+
+        var queue = new Stateforward.Hsm.Queue(push, pop, len);
+
+        Assert.NotNull(queue);
+        var hookConstructor = typeof(Stateforward.Hsm.Queue)
+            .GetConstructors()
+            .Single(ctor =>
+            {
+                var parameters = ctor.GetParameters();
+                return parameters.Length >= 3
+                       && parameters[0].ParameterType.IsGenericType
+                       && parameters[0].ParameterType.GetGenericTypeDefinition() == typeof(Func<,,>);
+            });
+
+        foreach (var parameter in hookConstructor.GetParameters().Take(3))
+        {
+            var returnType = parameter.ParameterType.GetGenericArguments().Last();
+            Assert.False(typeof(Task).IsAssignableFrom(returnType));
+        }
+    }
+
+    [Fact]
     public async Task CustomQueueReceivesRegularEventsOnlyAndCompletionEventsKeepPriority()
     {
         var pushed = new List<string>();

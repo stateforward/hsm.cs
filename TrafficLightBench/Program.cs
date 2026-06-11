@@ -21,6 +21,55 @@ namespace TrafficLightBench
             return int.TryParse(value, out var parsed) && parsed > 0 ? parsed : defaultValue;
         }
 
+        private static bool EnvBool(string name)
+        {
+            var value = Environment.GetEnvironmentVariable(name);
+            return value is not null && value != "" && value != "0" && value != "false" && value != "False";
+        }
+
+        private static void AssertTrafficLight(TrafficLight inst, IInstance sm, string state, int carsWaiting, int timer, string step)
+        {
+            if (sm.State != state)
+            {
+                throw new InvalidOperationException($"{step}: state {sm.State}, expected {state}");
+            }
+            if (inst.CarsWaiting != carsWaiting)
+            {
+                throw new InvalidOperationException($"{step}: CarsWaiting {inst.CarsWaiting}, expected {carsWaiting}");
+            }
+            if (inst.Timer != timer)
+            {
+                throw new InvalidOperationException($"{step}: Timer {inst.Timer}, expected {timer}");
+            }
+        }
+
+        private static async Task ValidateTrafficLight(Model model, Event carArrival, Event timerEvent)
+        {
+            var ctx = new Context();
+            var inst = new TrafficLight();
+            var sm = Hsm.Start(ctx, inst, model);
+            AssertTrafficLight(inst, sm, "/TrafficLight/operational/red", 0, 0, "initial");
+
+            var completion = sm.Dispatch(carArrival);
+            if (completion is null)
+            {
+                throw new InvalidOperationException("dispatch did not return an awaitable completion");
+            }
+            await completion.ConfigureAwait(false);
+            AssertTrafficLight(inst, sm, "/TrafficLight/operational/red", 1, 0, "after CarArrival");
+
+            await sm.Dispatch(timerEvent).ConfigureAwait(false);
+            AssertTrafficLight(inst, sm, "/TrafficLight/operational/green", 1, 40, "after first TimerEvent");
+
+            await sm.Dispatch(timerEvent).ConfigureAwait(false);
+            AssertTrafficLight(inst, sm, "/TrafficLight/operational/yellow", 1, 40, "after second TimerEvent");
+
+            await sm.Dispatch(timerEvent).ConfigureAwait(false);
+            AssertTrafficLight(inst, sm, "/TrafficLight/operational/red", 1, 40, "after third TimerEvent");
+
+            await sm.Stop().ConfigureAwait(false);
+        }
+
         private static async Task DispatchBatch(IInstance sm, int cycles, Event carArrival, Event timerEvent)
         {
             for (var i = 0; i < cycles; i++)
@@ -101,13 +150,17 @@ namespace TrafficLightBench
                 )
             );
 
-            var ctx = new Context();
-
             var carArrival = new Event("CarArrival");
             var timerEvent = new Event("TimerEvent");
 
+            if (EnvBool("HSM_BENCH_VALIDATE"))
+            {
+                await ValidateTrafficLight(model, carArrival, timerEvent).ConfigureAwait(false);
+            }
+
+            var warmupCtx = new Context();
             var warmupInst = new TrafficLight();
-            var warmupSm = Hsm.Start(ctx, warmupInst, model);
+            var warmupSm = Hsm.Start(warmupCtx, warmupInst, model);
             var batchCycles = 1;
             while (true)
             {
@@ -134,6 +187,7 @@ namespace TrafficLightBench
 
             var beforeAlloc = GC.GetAllocatedBytesForCurrentThread();
 
+            var ctx = new Context();
             var inst = new TrafficLight();
             var sm = Hsm.Start(ctx, inst, model);
 
