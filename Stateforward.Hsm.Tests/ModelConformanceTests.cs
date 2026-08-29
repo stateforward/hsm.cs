@@ -83,8 +83,8 @@ public sealed class ModelConformanceTests
                 "idle",
                 Hsm.Choice(
                     "branch",
-                    Hsm.Transition(Hsm.Target("../../left")),
-                    Hsm.Transition(Hsm.Target("../../right"), Hsm.Guard<TestMachine>((_, _, _) => true)))),
+                    Hsm.Transition(Hsm.Target("../left")),
+                    Hsm.Transition(Hsm.Target("../right"), Hsm.Guard<TestMachine>((_, _, _) => true)))),
             Hsm.State("left"),
             Hsm.State("right"),
             Hsm.Initial(Hsm.Target("idle"))));
@@ -120,14 +120,17 @@ public sealed class ModelConformanceTests
     }
 
     [Fact]
-    public void TopLevelTargetRequiresSourceAndInternalRequiresEffect()
+    public async Task TopLevelTargetRoutesFromTheActiveStateAndInternalRequiresEffect()
     {
-        var topLevelTarget = Assert.Throws<ValidationException>(() => Hsm.Define(
-            "BadTopLevelTarget",
+        var rootModel = Hsm.Define(
+            "RootTransition",
             Hsm.State("idle"),
             Hsm.State("done"),
             Hsm.Transition(Hsm.On("go"), Hsm.Target("done")),
-            Hsm.Initial(Hsm.Target("idle"))));
+            Hsm.Initial(Hsm.Target("idle")));
+        var machine = Hsm.Start(new Context(), new TestMachine(), rootModel);
+
+        await machine.Dispatch(new Event("go"));
 
         var internalTransition = Assert.Throws<ValidationException>(() => Hsm.Define(
             "BadInternal",
@@ -136,7 +139,7 @@ public sealed class ModelConformanceTests
                 Hsm.Transition(Hsm.On("go"))),
             Hsm.Initial(Hsm.Target("idle"))));
 
-        Assert.Contains("top level transitions with a target must also define a source", topLevelTarget.Message, StringComparison.Ordinal);
+        Assert.Equal("/RootTransition/done", machine.State);
         Assert.Contains("internal transitions require an effect", internalTransition.Message, StringComparison.Ordinal);
     }
 
@@ -174,14 +177,130 @@ public sealed class ModelConformanceTests
                     "branch",
                     Hsm.Transition(
                         Hsm.After<TestMachine>((_, _, _) => TimeSpan.FromSeconds(1)),
-                        Hsm.Target("../idle")),
-                    Hsm.Transition(Hsm.Target("../idle")))),
+                        Hsm.Target("idle")),
+                    Hsm.Transition(Hsm.Target("idle")))),
             Hsm.Initial(Hsm.Target("parent"))));
 
         Assert.Contains("already defined", duplicateAttribute.Message, StringComparison.Ordinal);
         Assert.Contains("already defined", duplicateOperation.Message, StringComparison.Ordinal);
         Assert.Contains("missing operation", missingOperation.Message, StringComparison.Ordinal);
         Assert.Contains("real state source", badTemporalSource.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void CompositeHistoryAttributeAndTemporalSourcesAreValidated()
+    {
+        Assert.Throws<ValidationException>(() => Hsm.Define(
+            "MissingCompositeInitial",
+            Hsm.Initial(Hsm.Target("container")),
+            Hsm.State("container", Hsm.State("child"))));
+        Assert.Throws<ValidationException>(() => Hsm.Define(
+            "MissingHistoryDefault",
+            Hsm.Initial(Hsm.Target("container/child")),
+            Hsm.State(
+                "container",
+                Hsm.State("child"),
+                Hsm.ShallowHistory("history"))));
+        Assert.Throws<ValidationException>(() => Hsm.Define(
+            "BadAttributeDefault",
+            Hsm.Attribute("count", "wrong", typeof(int)),
+            Hsm.Initial(Hsm.Target("idle")),
+            Hsm.State("idle")));
+        Assert.Throws<ValidationException>(() => Hsm.Define(
+            "MissingTemporalAttribute",
+            Hsm.Initial(Hsm.Target("idle")),
+            Hsm.State("idle", Hsm.Transition(Hsm.After("delay")))));
+        Assert.Throws<ValidationException>(() => Hsm.Define(
+            "BadTemporalAttributeType",
+            Hsm.Attribute("delay", 1),
+            Hsm.Initial(Hsm.Target("idle")),
+            Hsm.State("idle", Hsm.Transition(Hsm.After("delay")))));
+
+        var directHistory = Hsm.Define(
+            "DirectHistoryDefault",
+            Hsm.Initial(Hsm.Target("container/child")),
+            Hsm.State(
+                "container",
+                Hsm.State("child"),
+                Hsm.ShallowHistory("history", Hsm.Target("child"))));
+        Assert.NotNull(directHistory.Resolve("/DirectHistoryDefault/container/history"));
+
+        var numericDefault = Hsm.Define(
+            "NumericDefaultCompatibility",
+            Hsm.Attribute("count", 1L, typeof(double)),
+            Hsm.Initial(Hsm.Target("idle")),
+            Hsm.State("idle"));
+        Assert.NotNull(numericDefault);
+    }
+
+    [Fact]
+    public void MetadataNamespaceAndSubmachineBoundariesAreValidated()
+    {
+        Assert.Throws<ValidationException>(() => Hsm.OnSet("bad/name"));
+        Assert.Throws<ValidationException>(() => Hsm.OnCall("bad/name"));
+        Assert.Throws<ValidationException>(() => Hsm.Entry("bad/name"));
+        Assert.Throws<ValidationException>(() => Hsm.Guard("bad/name"));
+        Assert.Throws<ValidationException>(() => Hsm.Define(
+            "MissingBehaviorOperation",
+            Hsm.Initial(Hsm.Target("idle")),
+            Hsm.State("idle", Hsm.Entry("missing"))));
+        Assert.Throws<ValidationException>(() => Hsm.Define(
+            "SlashedAttribute",
+            Hsm.Attribute("bad/name", 1),
+            Hsm.Initial(Hsm.Target("idle")),
+            Hsm.State("idle")));
+        Assert.Throws<ValidationException>(() => Hsm.Define(
+            "SlashedOperation",
+            Hsm.Operation("bad/name"),
+            Hsm.Initial(Hsm.Target("idle")),
+            Hsm.State("idle")));
+        Assert.Throws<ValidationException>(() => Hsm.Define(
+            "MetadataCollision",
+            Hsm.Attribute("shared", 1),
+            Hsm.Operation("shared"),
+            Hsm.Initial(Hsm.Target("idle")),
+            Hsm.State("idle")));
+        Assert.Throws<ValidationException>(() => Hsm.Define(
+            "ImplicitAttributeCollision",
+            Hsm.Operation("shared"),
+            Hsm.Initial(Hsm.Target("idle")),
+            Hsm.State("idle", Hsm.Transition(Hsm.OnSet("shared")))));
+
+        var child = Hsm.Define(
+            "BoundaryChild",
+            Hsm.Initial(Hsm.Target("idle")),
+            Hsm.State("idle"));
+        Assert.Throws<ValidationException>(() => Hsm.Define(
+            "InvalidBoundary",
+            Hsm.Initial(Hsm.Target("drive")),
+            Hsm.SubmachineState("drive", child, Hsm.State("nested"))));
+        Assert.Throws<ValidationException>(() => Hsm.Define(
+            "InvalidBoundaryTarget",
+            Hsm.Initial(Hsm.Target("outside")),
+            Hsm.State(
+                "outside",
+                Hsm.Transition(Hsm.On("enter"), Hsm.Target("../drive/idle"))),
+            Hsm.SubmachineState("drive", child)));
+        Assert.Throws<ValidationException>(() => Hsm.Define(
+            "InvalidBoundarySource",
+            Hsm.Initial(Hsm.Target("drive")),
+            Hsm.SubmachineState("drive", child),
+            Hsm.State("outside"),
+            Hsm.Transition(
+                Hsm.Source("drive/idle"),
+                Hsm.On("leave"),
+                Hsm.Target("outside"))));
+        Assert.Throws<ValidationException>(() => Hsm.Define(
+            "StateConnectionCollision",
+            Hsm.EntryPoint("idle", Hsm.Target("idle")),
+            Hsm.Initial(Hsm.Target("idle")),
+            Hsm.State("idle")));
+        Assert.Throws<ValidationException>(() => Hsm.Define(
+            "ConnectionCollision",
+            Hsm.EntryPoint("route", Hsm.Target("idle")),
+            Hsm.ExitPoint("route"),
+            Hsm.Initial(Hsm.Target("idle")),
+            Hsm.State("idle")));
     }
 
     [Fact]

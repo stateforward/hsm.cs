@@ -9,6 +9,8 @@ public sealed class ParityApiTests
         public string Marker => "machine";
         public string Echo(string value) => value;
         public string Join(string prefix, params string[] rest) => prefix + ":" + string.Join(",", rest);
+        public Exception? LastError { get; private set; }
+        public override void OnRuntimeError(Exception error) => LastError = error;
     }
 
     [Fact]
@@ -83,6 +85,44 @@ public sealed class ParityApiTests
     }
 
     [Fact]
+    public async Task GroupDispatchFromBehaviorDefersSiblingFanoutUntilProducerIsIdle()
+    {
+        Group? group = null;
+        var trace = new List<string>();
+        var model = Hsm.Define(
+            "BehaviorGroupDispatch",
+            Hsm.Initial(Hsm.Target("idle")),
+            Hsm.State(
+                "idle",
+                Hsm.Transition(
+                    Hsm.On("send"),
+                    Hsm.Target("../sent"),
+                    Hsm.Effect<TestMachine>((_, _, _) => group!.Dispatch(new Event("fanout")).GetAwaiter().GetResult())),
+                Hsm.Transition(
+                    Hsm.On("fanout"),
+                    Hsm.Target("../done"),
+                    Hsm.Effect<TestMachine>((_, instance, _) => trace.Add(Hsm.ID(instance))))),
+            Hsm.State(
+                "sent",
+                Hsm.Transition(
+                    Hsm.On("fanout"),
+                    Hsm.Target("../done"),
+                    Hsm.Effect<TestMachine>((_, instance, _) => trace.Add(Hsm.ID(instance))))),
+            Hsm.State("done"));
+        var context = new Context();
+        var alpha = Hsm.Start(context, new TestMachine(), model, new Config { Id = "alpha" });
+        var bravo = Hsm.Start(context, new TestMachine(), model, new Config { Id = "bravo" });
+        group = Hsm.MakeGroup("fleet", alpha, bravo);
+
+        await alpha.Dispatch(new Event("send"));
+        await Hsm.AfterIdle(context);
+
+        Assert.Equal("/BehaviorGroupDispatch/done", alpha.State);
+        Assert.Equal("/BehaviorGroupDispatch/done", bravo.State);
+        Assert.Equal(new[] { "alpha", "bravo" }, trace);
+    }
+
+    [Fact]
     public async Task DispatchFallbackAndTargetedDispatchUseContextAndIdPatterns()
     {
         var model = Hsm.Define(
@@ -112,6 +152,187 @@ public sealed class ParityApiTests
         Assert.True(Hsm.Match("charlie", "*lie"));
         Assert.True(Hsm.Match("/DispatchParity/idle", "*/idle"));
         Assert.False(Hsm.Match("bravo", "a*", "*lie"));
+    }
+
+    [Fact]
+    public async Task NativeSubmachineAndRedefineReplayModelsUnderTheirOwningRoot()
+    {
+        var child = Hsm.Define(
+            "ReusableChild",
+            Hsm.Initial(Hsm.Target("idle")),
+            Hsm.State("idle", Hsm.Transition(Hsm.On("finish"), Hsm.Target("../done"))),
+            Hsm.State("done"));
+        var host = Hsm.Define(
+            "ReplayHost",
+            Hsm.Initial(Hsm.Target("drive")),
+            Hsm.Submachine("drive", child));
+        var derived = Hsm.Redefine(
+            "DerivedReplayHost",
+            host,
+            Hsm.State("complete"));
+
+        var machine = Hsm.Start(new Context(), new TestMachine(), derived);
+        await machine.Dispatch(new Event("finish"));
+
+        Assert.Equal("/DerivedReplayHost/drive/done", machine.State);
+        Assert.Equal("/ReusableChild/idle", Hsm.Start(new Context(), new TestMachine(), child).State);
+    }
+
+    [Fact]
+    public async Task NativeConnectionPointsRouteThroughSubmachineBoundaries()
+    {
+        var trace = new List<string>();
+        var child = Hsm.Define(
+            "ConnectionChild",
+            Hsm.EntryPoint(
+                "warm",
+                "running",
+                Hsm.Effect<TestMachine>((_, _, _) => trace.Add("entry-point"))),
+            Hsm.ExitPoint(
+                "done",
+                Hsm.Effect<TestMachine>((_, _, _) => trace.Add("exit-point"))),
+            Hsm.Initial(Hsm.Target("idle")),
+            Hsm.State("idle"),
+            Hsm.State(
+                "running",
+                Hsm.Entry<TestMachine>((_, _, _) => trace.Add("running-entry")),
+                Hsm.Transition(Hsm.On("finish"), Hsm.ToExitPoint("done"))));
+        var host = Hsm.Define(
+            "ConnectionHost",
+            Hsm.Initial(Hsm.Target("outside")),
+            Hsm.State(
+                "outside",
+                Hsm.Transition(
+                    Hsm.On("enter"),
+                    Hsm.Target("../drive"),
+                    Hsm.ToEntryPoint("warm"))),
+            Hsm.Submachine(
+                "drive",
+                child,
+                Hsm.Transition(
+                    Hsm.OnExitPoint("done"),
+                    Hsm.Target("../complete"))),
+            Hsm.State("complete"));
+
+        var machine = Hsm.Start(new Context(), new TestMachine(), host);
+        await machine.Dispatch(new Event("enter"));
+        Assert.Equal("/ConnectionHost/drive/running", machine.State);
+        Assert.Equal(new[] { "entry-point", "running-entry" }, trace);
+
+        await machine.Dispatch(new Event("finish"));
+        Assert.Equal("/ConnectionHost/complete", machine.State);
+        Assert.Equal(new[] { "entry-point", "running-entry", "exit-point" }, trace);
+    }
+
+    [Fact]
+    public async Task NativeUnhandledExitPointsBecomeRuntimeErrors()
+    {
+        var observed = new TaskCompletionSource<Exception>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var child = Hsm.Define(
+            "UnhandledConnectionChild",
+            Hsm.ExitPoint("done"),
+            Hsm.Initial(Hsm.Target("running")),
+            Hsm.State("running", Hsm.Transition(Hsm.On("finish"), Hsm.ToExitPoint("done"))));
+        var host = Hsm.Define(
+            "UnhandledConnectionHost",
+            Hsm.Initial(Hsm.Target("drive")),
+            Hsm.Submachine(
+                "drive",
+                child,
+                Hsm.Transition(
+                    Hsm.On("hsm/error"),
+                    Hsm.Effect<TestMachine>((_, _, evt) => observed.TrySetResult(Assert.IsAssignableFrom<Exception>(evt.Data))))));
+
+        var machine = Hsm.Start(new Context(), new TestMachine(), host);
+        await machine.Dispatch(new Event("finish"));
+
+        var error = await observed.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        Assert.IsType<UnhandledExitPointException>(error);
+    }
+
+    [Fact]
+    public async Task AncestorExitPointHandlersAreClonedForEveryMatchingSubmachine()
+    {
+        var child = Hsm.Define(
+            "ReusableExitChild",
+            Hsm.ExitPoint("done"),
+            Hsm.Initial(Hsm.Target("active")),
+            Hsm.State("active", Hsm.Transition(Hsm.On("finish"), Hsm.ToExitPoint("done"))));
+        var host = Hsm.Define(
+            "RepeatedExitHost",
+            Hsm.Initial(Hsm.Target("left")),
+            Hsm.Submachine("left", child),
+            Hsm.Submachine("right", child),
+            Hsm.State("outside"),
+            Hsm.Transition(Hsm.OnExitPoint("done"), Hsm.Target("outside")));
+        var machine = Hsm.Start(new Context(), new TestMachine(), host);
+
+        await machine.Dispatch(new Event("finish"));
+
+        Assert.Equal("/RepeatedExitHost/outside", machine.State);
+    }
+
+    [Fact]
+    public async Task CanonicalCompositionApisFlattenMetadataAndRouteConnectionPoints()
+    {
+        var child = Hsm.DefineSubmachine(
+            "CanonicalChild",
+            Hsm.Attribute("child_count", 7),
+            Hsm.Operation("child_ping", new Func<string>(() => "child")),
+            Hsm.EntryPoint("warm", Hsm.Target("active")),
+            Hsm.ExitPoint("done"),
+            Hsm.Initial(Hsm.Target("cold")),
+            Hsm.State("cold"),
+            Hsm.State(
+                "active",
+                Hsm.Transition(Hsm.On("finish"), Hsm.ExitPoint("done"))));
+        var host = Hsm.Define(
+            "CanonicalHost",
+            Hsm.Initial(Hsm.Target("outside")),
+            Hsm.State(
+                "outside",
+                Hsm.Transition(Hsm.On("enter"), Hsm.Target("../drive"), Hsm.EntryPoint("warm"))),
+            Hsm.SubmachineState(
+                "drive",
+                child,
+                Hsm.Transition(Hsm.ExitPoint("done"), Hsm.Target("../complete"))),
+            Hsm.State("complete"));
+        var context = new Context();
+        var machine = Hsm.Start(context, new TestMachine(), host);
+
+        Assert.Equal("child", Hsm.Call(context, machine, "child_ping"));
+        Assert.Equal(7, Hsm.TakeSnapshot(context, machine).Attributes["/CanonicalHost/child_count"]);
+
+        await machine.Dispatch(new Event("enter"));
+        Assert.Equal("/CanonicalHost/drive/active", machine.State);
+        await machine.Dispatch(new Event("finish"));
+        Assert.Equal("/CanonicalHost/complete", machine.State);
+    }
+
+    [Fact]
+    public void CanonicalRedefineAllowsOneLaterMetadataOverride()
+    {
+        var source = Hsm.Define(
+            "MetadataBase",
+            Hsm.Attribute("count", 1),
+            Hsm.Operation("label", new Func<string>(() => "base")),
+            Hsm.Initial(Hsm.Target("idle")),
+            Hsm.State("idle"));
+        var derived = Hsm.Redefine(
+            source,
+            "MetadataDerived",
+            Hsm.Attribute("count", 2),
+            Hsm.Operation("label", new Func<string>(() => "derived")));
+        var context = new Context();
+        var machine = Hsm.Start(context, new TestMachine(), derived);
+
+        Assert.Equal(2, Hsm.Get<int>(context, machine, "count"));
+        Assert.Equal("derived", Hsm.Call(context, machine, "label"));
+        Assert.Throws<ValidationException>(() => Hsm.Redefine(
+            source,
+            "BadMetadataDerived",
+            Hsm.Attribute("count", 2),
+            Hsm.Attribute("count", 3)));
     }
 
     [Fact]
@@ -183,23 +404,99 @@ public sealed class ParityApiTests
     }
 
     [Fact]
-    public async Task OnSetSupportsImplicitAttributesAndSlashedNames()
+    public async Task OnSetSupportsImplicitAttributes()
     {
         var model = Hsm.Define(
             "ImplicitAttributeParity",
             Hsm.Initial(Hsm.Target("idle")),
             Hsm.State(
                 "idle",
-                Hsm.Transition(Hsm.OnSet("config/value"), Hsm.Target("../done"))),
+                Hsm.Transition(Hsm.OnSet("config_value"), Hsm.Target("../done"))),
             Hsm.State("done"));
 
         var context = new Context();
         var machine = Hsm.Start(context, new TestMachine(), model);
 
-        await Hsm.Set(context, machine, "config/value", 42);
+        await Hsm.Set(context, machine, "config_value", 42);
 
         Assert.Equal("/ImplicitAttributeParity/done", machine.State);
-        Assert.Equal(42, Hsm.Get<int>(context, machine, "config/value"));
+        Assert.Equal(42, Hsm.Get<int>(context, machine, "config_value"));
+    }
+
+    [Fact]
+    public async Task NamedOperationBehaviorsInvokeDirectlyWithoutOnCallEvents()
+    {
+        var trace = new List<string>();
+        var workEntered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var model = Hsm.Define(
+            "NamedOperationBehaviors",
+            Hsm.Operation("enter", new Action<Context, TestMachine, Event>((_, _, evt) => trace.Add("enter:" + evt.Name))),
+            Hsm.Operation("leave", new Action<Context, TestMachine, Event>((_, _, evt) => trace.Add("leave:" + evt.Name))),
+            Hsm.Operation("work", new Action<Context, TestMachine, Event>((_, _, evt) =>
+            {
+                trace.Add("work:" + evt.Name);
+                workEntered.TrySetResult(true);
+            })),
+            Hsm.Operation("effect", new Action<Context, TestMachine, Event>((_, _, evt) => trace.Add("effect:" + evt.Name))),
+            Hsm.Operation("allowed", new Func<Context, TestMachine, Event, bool>((_, _, evt) =>
+            {
+                trace.Add("allowed:" + evt.Name);
+                return true;
+            })),
+            Hsm.Initial(Hsm.Target("idle")),
+            Hsm.State(
+                "idle",
+                Hsm.Entry("enter"),
+                Hsm.Activity("work"),
+                Hsm.Exit("leave"),
+                Hsm.Transition(
+                    Hsm.On("go"),
+                    Hsm.Guard("allowed"),
+                    Hsm.Target("../done"),
+                    Hsm.Effect("effect")),
+                Hsm.Transition(Hsm.OnCall("effect"), Hsm.Target("../wrong"))),
+            Hsm.State("done"),
+            Hsm.State("wrong"));
+
+        var machine = Hsm.Start(new Context(), new TestMachine(), model);
+        Assert.Null(machine.LastError);
+        await workEntered.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        await machine.Dispatch(new Event("go"));
+
+        Assert.Equal("/NamedOperationBehaviors/done", machine.State);
+        Assert.Equal(
+            new[] { "enter:hsm/initial", "work:hsm/initial", "allowed:go", "leave:go", "effect:go" },
+            trace);
+    }
+
+    [Fact]
+    public async Task NamedOperationActivitiesDoNotBlockStart()
+    {
+        var entered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var release = new ManualResetEventSlim();
+        var model = Hsm.Define(
+            "NamedOperationActivity",
+            Hsm.Operation("hold", new Action<Context, TestMachine, Event>((_, _, _) =>
+            {
+                entered.TrySetResult(true);
+                release.Wait();
+            })),
+            Hsm.Initial(Hsm.Target("active")),
+            Hsm.State("active", Hsm.Activity("hold")));
+
+        var start = Task.Run(() => Hsm.Start(new Context(), new TestMachine(), model));
+        try
+        {
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(1));
+            Assert.True(start.IsCompleted, "Start was blocked by a named operation activity");
+        }
+        finally
+        {
+            release.Set();
+        }
+
+        var machine = await start;
+        await machine.Stop();
     }
 
     [Fact]
@@ -247,7 +544,7 @@ public sealed class ParityApiTests
     }
 
     [Fact]
-    public async Task SetIgnoresUnknownAttributesAndExactTypeMismatches()
+    public async Task SetReportsRuntimeErrorsForUnknownAttributesAndExactTypeMismatches()
     {
         var model = Hsm.Define(
             "SetRejectedParity",
@@ -261,11 +558,11 @@ public sealed class ParityApiTests
         var context = new Context();
         var machine = Hsm.Start(context, new TestMachine(), model);
 
-        await Hsm.Set(context, machine, "missing", 1);
+        await Assert.ThrowsAsync<AttributeHsmException>(() => Hsm.Set(context, machine, "missing", 1));
         Assert.Equal("/SetRejectedParity/idle", machine.State);
         Assert.Equal(0, Hsm.Get<int>(context, machine, "count"));
 
-        await Hsm.Set(context, machine, "count", 1L);
+        await Assert.ThrowsAsync<AttributeHsmException>(() => Hsm.Set(context, machine, "count", 1L));
         Assert.Equal("/SetRejectedParity/idle", machine.State);
         Assert.Equal(0, Hsm.Get<int>(context, machine, "count"));
     }
@@ -304,7 +601,7 @@ public sealed class ParityApiTests
     }
 
     [Fact]
-    public void NewBindsAModelBeforeStart()
+    public void NewBindsAModelWithoutActivatingStateBeforeStart()
     {
         var model = Hsm.Define(
             "NewParity",
@@ -312,7 +609,7 @@ public sealed class ParityApiTests
             Hsm.State("idle"));
 
         var machine = Hsm.New(new TestMachine(), model, new Config { Id = "bound" });
-        Assert.Equal("/NewParity", machine.State);
+        Assert.Equal(string.Empty, machine.State);
 
         Hsm.Start(new Context(), machine);
         Assert.Equal("/NewParity/idle", machine.State);
@@ -326,33 +623,47 @@ public sealed class ParityApiTests
         var machine = new TestMachine();
         var model = Hsm.Define(
             "CallParity",
-            Hsm.Operation("ops/args", new Func<int, int, int>((left, right) => left + right)),
-            Hsm.Operation("ops/context", new Func<Context, string>(ctx => Hsm.ID(Hsm.FromContext(ctx)!))),
-            Hsm.Operation("ops/instance", new Func<TestMachine, string>(machine => machine.Marker)),
-            Hsm.Operation("ops/method", new Func<string, string>(machine.Echo)),
-            Hsm.Operation("ops/params", new Func<string, string[], string>(machine.Join)),
-            Hsm.Operation("ops/bad", new Func<CancellationToken, string>(_ => "bad")),
+            Hsm.Operation("args", new Func<int, int, int>((left, right) => left + right)),
+            Hsm.Operation("context", new Func<Context, string>(ctx => Hsm.ID(Hsm.FromContext(ctx)!))),
+            Hsm.Operation("instance", new Func<TestMachine, string>(machine => machine.Marker)),
+            Hsm.Operation("method", new Func<string, string>(machine.Echo)),
+            Hsm.Operation("params", new Func<string, string[], string>(machine.Join)),
+            Hsm.Operation("bad", new Func<CancellationToken, string>(_ => "bad")),
             Hsm.Initial(Hsm.Target("idle")),
             Hsm.State(
                 "idle",
                 Hsm.Transition(
-                    Hsm.OnCall("ops/method"),
+                    Hsm.OnCall("method"),
                     Hsm.Effect<TestMachine>((_, _, evt) => observed = Assert.IsType<CallData>(evt.Data)))));
 
         var context = new Context();
         Hsm.Start(context, machine, model, new Config { Id = "caller" });
 
-        Assert.Equal(5, Hsm.Call(context, machine, "ops/args", 2, 3));
-        Assert.Equal("caller", Hsm.Call(context, machine, "ops/context"));
-        Assert.Equal("machine", Hsm.Call(context, machine, "ops/instance"));
-        Assert.Equal("echo", Hsm.Call(context, machine, "ops/method", "echo"));
-        Assert.Equal("root:a,b", Hsm.Call(context, machine, "ops/params", "root", "a", "b"));
+        Assert.Equal(5, Hsm.Call(context, machine, "args", 2, 3));
+        Assert.Equal("caller", Hsm.Call(context, machine, "context"));
+        Assert.Equal("machine", Hsm.Call(context, machine, "instance"));
+        Assert.Equal("echo", Hsm.Call(context, machine, "method", "echo"));
+        Assert.Equal("root:a,b", Hsm.Call(context, machine, "params", "root", "a", "b"));
 
         Assert.NotNull(observed);
-        Assert.Equal("/CallParity/ops/method", observed!.Name);
+        Assert.Equal("/CallParity/method", observed!.Name);
         Assert.Equal(new object?[] { "echo" }, observed.Args);
 
-        Assert.Throws<MissingOperationException>(() => Hsm.Call(context, machine, "ops/missing"));
-        Assert.Throws<InvalidOperationSignatureException>(() => Hsm.Call(context, machine, "ops/bad"));
+        Assert.Throws<MissingOperationException>(() => Hsm.Call(context, machine, "missing"));
+        Assert.Throws<InvalidOperationSignatureException>(() => Hsm.Call(context, machine, "bad"));
+    }
+
+    [Fact]
+    public void ContractOnlyOperationsResolvePublicInstanceMethods()
+    {
+        var model = Hsm.Define(
+            "InstanceOperationContract",
+            Hsm.Operation(nameof(TestMachine.Echo)),
+            Hsm.Initial(Hsm.Target("idle")),
+            Hsm.State("idle"));
+        var context = new Context();
+        var machine = Hsm.Start(context, new TestMachine(), model);
+
+        Assert.Equal("hello", Hsm.Call(context, machine, nameof(TestMachine.Echo), "hello"));
     }
 }

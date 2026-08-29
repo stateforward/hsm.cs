@@ -32,6 +32,13 @@ public sealed class MissingOperationException : HsmRuntimeException
     }
 }
 
+public sealed class AttributeHsmException : HsmRuntimeException
+{
+    public AttributeHsmException(string message) : base(message)
+    {
+    }
+}
+
 public sealed class InvalidOperationSignatureException : HsmRuntimeException
 {
     public InvalidOperationSignatureException(string operationName) : base($"invalid operation '{operationName}'")
@@ -42,6 +49,13 @@ public sealed class InvalidOperationSignatureException : HsmRuntimeException
 public sealed class AlreadyStartedException : HsmRuntimeException
 {
     public AlreadyStartedException() : base("hsm already started")
+    {
+    }
+}
+
+public sealed class UnhandledExitPointException : HsmRuntimeException
+{
+    public UnhandledExitPointException(string exitPoint) : base($"unhandled exit point '{exitPoint}'")
     {
     }
 }
@@ -122,6 +136,8 @@ public class Event
 
 public class CompletionEvent : Event
 {
+    public const string EventName = "hsm/final";
+
     public CompletionEvent(string name, object? data = null, string? source = null)
         : base(name, Kind.CompletionEvent, data, source)
     {
@@ -130,7 +146,7 @@ public class CompletionEvent : Event
 
 public sealed class InitialEvent : CompletionEvent
 {
-    public const string EventName = "hsm.initial";
+    public new const string EventName = "hsm/initial";
 
     public InitialEvent(object? data = null)
         : base(EventName, data)
@@ -140,7 +156,7 @@ public sealed class InitialEvent : CompletionEvent
 
 public sealed class ErrorEvent : Event
 {
-    public ErrorEvent(object? error = null, string name = "hsm.error")
+    public ErrorEvent(object? error = null, string name = "hsm/error")
         : base(name, Kind.ErrorEvent, error)
     {
     }
@@ -213,6 +229,9 @@ public sealed class Model : State
     public Dictionary<string, Event> Events { get; } = new(StringComparer.Ordinal);
     public Dictionary<string, Dictionary<string, List<Transition>>> TransitionMap { get; } = new(StringComparer.Ordinal);
     public Dictionary<string, HashSet<string>> DeferredMap { get; } = new(StringComparer.Ordinal);
+    internal HashSet<string> SubmachineBoundaries { get; } = new(StringComparer.Ordinal);
+    internal IReadOnlyList<IPartial> DefinitionPartials { get; set; } = Array.Empty<IPartial>();
+    internal bool AllowUnresolvedOperations { get; set; }
 
     public NamedElement? Resolve(string qualifiedName)
     {
@@ -242,11 +261,18 @@ public sealed class Transition : NamedElement
         OwnerQualifiedNameInternal = ownerQualifiedName;
     }
 
-    internal string OwnerQualifiedNameInternal { get; }
+    internal string OwnerQualifiedNameInternal { get; set; }
     internal string? PendingSourceQualifiedName { get; set; }
     internal string? PendingTargetQualifiedName { get; set; }
+    internal string? PendingTargetPath { get; set; }
+    internal string? PendingEntryPoint { get; set; }
+    internal string? PendingExitPointTarget { get; set; }
+    internal string? PendingExitPointTrigger { get; set; }
+    internal string? ReentryBoundary { get; set; }
+    internal int ConnectionPointPriority { get; set; }
     internal bool ExplicitSource { get; set; }
     internal bool ExplicitTarget { get; set; }
+    internal bool ComposedDefinition { get; set; }
     internal List<string> PendingOnSetAttributes { get; } = new();
     internal List<string> PendingOnCallOperations { get; } = new();
     internal List<TemporalDefinition> TemporalDefinitions { get; } = new();
@@ -273,39 +299,45 @@ public sealed class Constraint : NamedElement
 
 public sealed class Behavior : NamedElement
 {
-    internal Behavior(string qualifiedName, bool concurrent, OperationInvoker operation, string? id = null)
+    internal Behavior(string qualifiedName, bool concurrent, OperationInvoker operation, string? resolutionScope = null, string? id = null)
         : base(concurrent ? Kind.ConcurrentBehavior : Kind.Behavior, qualifiedName, id)
     {
         Concurrent = concurrent;
         Invoke = operation;
+        ResolutionScope = resolutionScope;
     }
 
     public bool Concurrent { get; }
     internal OperationInvoker Invoke { get; }
+    internal string? ResolutionScope { get; }
 }
 
 public sealed class AttributeDefinition : NamedElement
 {
-    public AttributeDefinition(string qualifiedName, object? defaultValue, bool hasDefault, string? id = null)
+    public AttributeDefinition(string qualifiedName, object? defaultValue, bool hasDefault, Type valueType, string? id = null)
         : base(Kind.Attribute, qualifiedName, id)
     {
         DefaultValue = defaultValue;
         HasDefault = hasDefault;
+        ValueType = valueType;
     }
 
     public object? DefaultValue { get; }
     public bool HasDefault { get; }
+    public Type ValueType { get; }
 }
 
 public sealed class OperationDefinition : NamedElement
 {
-    public OperationDefinition(string qualifiedName, Delegate callback, string? id = null)
+    public OperationDefinition(string qualifiedName, Delegate? callback, string? resolutionScope = null, string? id = null)
         : base(Kind.Operation, qualifiedName, id)
     {
         Callback = callback;
+        ResolutionScope = resolutionScope;
     }
 
-    public Delegate Callback { get; }
+    public Delegate? Callback { get; }
+    internal string? ResolutionScope { get; }
 }
 
 internal sealed class InitialPseudostate : Vertex
@@ -349,12 +381,13 @@ internal sealed class TemporalDefinition
     public required TemporalKind Kind { get; init; }
     public required string EventName { get; init; }
     public required Kind EventKind { get; init; }
+    public string? AttributeName { get; init; }
     public DurationInvoker? Duration { get; init; }
     public TimeInvoker? Time { get; init; }
     public ConditionInvoker? Condition { get; init; }
 }
 
-internal delegate void OperationInvoker(Context ctx, Instance instance, Event @event);
+internal delegate ValueTask OperationInvoker(Context ctx, Instance instance, Event @event);
 internal delegate bool GuardInvoker(Context ctx, Instance instance, Event @event);
 internal delegate TimeSpan DurationInvoker(Context ctx, Instance instance, Event @event);
 internal delegate DateTimeOffset TimeInvoker(Context ctx, Instance instance, Event @event);

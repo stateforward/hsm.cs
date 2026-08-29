@@ -87,7 +87,7 @@ internal sealed class Scenario
             GC.WaitForPendingFinalizers();
             GC.Collect();
 
-            var beforeAlloc = GC.GetAllocatedBytesForCurrentThread();
+            var beforeAlloc = GC.GetTotalAllocatedBytes(precise: true);
             var stopwatch = Stopwatch.StartNew();
 
             for (var i = 0; i < _iterations; i++)
@@ -97,7 +97,7 @@ internal sealed class Scenario
             }
 
             stopwatch.Stop();
-            var afterAlloc = GC.GetAllocatedBytesForCurrentThread();
+            var afterAlloc = GC.GetTotalAllocatedBytes(precise: true);
             var transitionCount = _iterations * 2L;
             var nsPerTransition = stopwatch.Elapsed.TotalMilliseconds * 1_000_000d / transitionCount;
             var transitionsPerSecond = transitionCount / stopwatch.Elapsed.TotalSeconds;

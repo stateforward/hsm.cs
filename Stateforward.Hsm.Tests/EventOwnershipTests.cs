@@ -24,7 +24,7 @@ public sealed class EventOwnershipTests
         string SchemaOwner);
 
     [Fact]
-    public async Task BehaviorMetadataMutationsDoNotReachCallerEventButDataRemainsShared()
+    public async Task BehaviorCoreFieldMutationsAreIsolatedWhileApplicationMetadataAndDataRemainShared()
     {
         var payload = new Payload();
         var schema = new Dictionary<string, object?> { ["owner"] = "caller" };
@@ -73,7 +73,7 @@ public sealed class EventOwnershipTests
         Assert.Equal("/caller/target", callerEvent.Target);
         Assert.Equal("caller-id", callerEvent.ID);
         Assert.Equal(Kind.CallEvent, callerEvent.Kind);
-        Assert.Equal("caller", schema["owner"]);
+        Assert.Equal("alpha", schema["owner"]);
         Assert.Equal(new[] { "alpha" }, payload.SeenBy);
     }
 
@@ -81,7 +81,7 @@ public sealed class EventOwnershipTests
     [InlineData("all")]
     [InlineData("to")]
     [InlineData("group")]
-    public async Task BroadcastDispatchCreatesIsolatedMetadataForEachRecipientAndSharesData(string mode)
+    public async Task BroadcastDispatchIsolatesCoreFieldsAndSharesApplicationMetadataAndData(string mode)
     {
         var observations = new List<Observation>();
         var gate = new object();
@@ -161,8 +161,9 @@ public sealed class EventOwnershipTests
             Assert.Equal("/caller/target", observation.Target);
             Assert.Equal("caller-id", observation.ID);
             Assert.Equal(Kind.CallEvent, observation.Kind);
-            Assert.Equal("caller", observation.SchemaOwner);
         }
+        Assert.Equal("caller", observations.Single(item => item.InstanceId == "alpha").SchemaOwner);
+        Assert.Equal("alpha", observations.Single(item => item.InstanceId == "bravo").SchemaOwner);
 
         Assert.Equal("go", callerEvent.Name);
         Assert.Equal("/caller/qualified", callerEvent.QualifiedName);
@@ -170,7 +171,7 @@ public sealed class EventOwnershipTests
         Assert.Equal("/caller/target", callerEvent.Target);
         Assert.Equal("caller-id", callerEvent.ID);
         Assert.Equal(Kind.CallEvent, callerEvent.Kind);
-        Assert.Equal("caller", callerSchema["owner"]);
+        Assert.Equal("bravo", callerSchema["owner"]);
         Assert.Equal(new[] { "alpha", "bravo" }, payload.SeenBy.OrderBy(id => id));
     }
 }

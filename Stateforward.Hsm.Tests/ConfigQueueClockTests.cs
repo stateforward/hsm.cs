@@ -101,7 +101,7 @@ public sealed class ConfigQueueClockTests
             Hsm.Initial(Hsm.Target("idle")),
             Hsm.State(
                 "idle",
-                Hsm.Transition(Hsm.On("hsm.error"), Hsm.Target("../recovered"))),
+                Hsm.Transition(Hsm.On("hsm/error"), Hsm.Target("../recovered"))),
             Hsm.State("recovered"));
 
         var machine = Hsm.Start(new Context(), new TestMachine(), model, new Config { Queue = queue });
@@ -141,7 +141,7 @@ public sealed class ConfigQueueClockTests
             Hsm.Initial(Hsm.Target("idle")),
             Hsm.State(
                 "idle",
-                Hsm.Transition(Hsm.On("hsm.error"), Hsm.Target("../recovered")),
+                Hsm.Transition(Hsm.On("hsm/error"), Hsm.Target("../recovered")),
                 Hsm.Transition(Hsm.On("go"), Hsm.Target("../regular"))),
             Hsm.State("recovered"),
             Hsm.State("regular"));
@@ -196,5 +196,29 @@ public sealed class ConfigQueueClockTests
         {
             Hsm.DefaultClock = previousDefaultClock;
         }
+    }
+
+    [Fact]
+    public async Task AfterClockFailuresRouteThroughRuntimeErrorEvents()
+    {
+        var clock = new Clock(delayAsync: (_, _) => Task.FromException(new InvalidOperationException("clock failed")));
+        var model = Hsm.Define(
+            "AfterClockError",
+            Hsm.Initial(Hsm.Target("waiting")),
+            Hsm.State(
+                "waiting",
+                Hsm.Transition(Hsm.After<TestMachine>((_, _, _) => TimeSpan.FromMilliseconds(1)), Hsm.Target("../late")),
+                Hsm.Transition(Hsm.On("hsm/error"), Hsm.Target("../recovered"))),
+            Hsm.State("late"),
+            Hsm.State("recovered"));
+
+        var machine = Hsm.Start(new Context(), new TestMachine(), model, new Config { Clock = clock });
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(1));
+        while (machine.State != "/AfterClockError/recovered")
+        {
+            await Task.Delay(10, timeout.Token);
+        }
+
+        Assert.Equal("/AfterClockError/recovered", machine.State);
     }
 }

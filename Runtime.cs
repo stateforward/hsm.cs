@@ -19,20 +19,32 @@ public sealed class Context
     {
         public object Gate { get; } = new();
         public List<IInstance> Instances { get; } = new();
+        public List<Task> Fanouts { get; } = new();
         public IInstance? PrimaryInstance { get; set; }
     }
 
     private readonly SharedState _shared;
     private readonly CancellationTokenSource _source;
+    internal RuntimeEngine? ActivityProducer { get; }
+    internal int? ActivityGeneration { get; }
+    internal bool HasStaleActivityProducer => ActivityProducer is not null
+        && ActivityGeneration is int generation
+        && !ActivityProducer.IsCurrentActivityGeneration(generation);
 
     public Context() : this(new SharedState(), new CancellationTokenSource())
     {
     }
 
-    private Context(SharedState shared, CancellationTokenSource source)
+    private Context(
+        SharedState shared,
+        CancellationTokenSource source,
+        RuntimeEngine? activityProducer = null,
+        int? activityGeneration = null)
     {
         _shared = shared;
         _source = source;
+        ActivityProducer = activityProducer;
+        ActivityGeneration = activityGeneration;
     }
 
     public CancellationToken CancellationToken => _source.Token;
@@ -40,9 +52,16 @@ public sealed class Context
 
     public void Cancel()
     {
+        if (!RuntimeEngine.TryAcquireActivityLease(this, out _, out _, out var activityLease))
+        {
+            return;
+        }
+        using (activityLease)
+        {
         if (!_source.IsCancellationRequested)
         {
             _source.Cancel();
+        }
         }
     }
 
@@ -57,6 +76,18 @@ public sealed class Context
 
             _shared.Instances.Add(instance);
             _shared.PrimaryInstance ??= instance;
+        }
+    }
+
+    internal void Unregister(IInstance instance)
+    {
+        lock (_shared.Gate)
+        {
+            _shared.Instances.Remove(instance);
+            if (ReferenceEquals(_shared.PrimaryInstance, instance))
+            {
+                _shared.PrimaryInstance = _shared.Instances.FirstOrDefault();
+            }
         }
     }
 
@@ -79,12 +110,48 @@ public sealed class Context
         }
     }
 
-    internal Context CreateLinked(CancellationToken cancellationToken)
+    internal void ScheduleFanout(Task fanout, RuntimeEngine producer)
+    {
+        lock (_shared.Gate) _shared.Fanouts.Add(fanout);
+        _ = fanout.ContinueWith(
+            completed =>
+            {
+                lock (_shared.Gate) _shared.Fanouts.Remove(completed);
+                if (completed.IsFaulted)
+                {
+                    producer.ReportAsyncError(completed.Exception!.GetBaseException());
+                }
+            },
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
+    }
+
+    internal async Task DrainFanouts()
+    {
+        while (true)
+        {
+            Task[] fanouts;
+            lock (_shared.Gate)
+            {
+                fanouts = _shared.Fanouts.ToArray();
+                _shared.Fanouts.Clear();
+            }
+
+            if (fanouts.Length == 0) return;
+            await Task.WhenAll(fanouts).ConfigureAwait(false);
+        }
+    }
+
+    internal Context CreateLinked(
+        CancellationToken cancellationToken,
+        RuntimeEngine? activityProducer = null,
+        int? activityGeneration = null)
     {
         var source = CancellationTokenSource.CreateLinkedTokenSource(
             _source.Token,
             cancellationToken.CanBeCanceled ? cancellationToken : CancellationToken.None);
-        return new Context(_shared, source);
+        return new Context(_shared, source, activityProducer, activityGeneration);
     }
 
     internal void Dispose() => _source.Dispose();
@@ -158,12 +225,24 @@ public sealed class Config
 internal sealed class PendingEvent
 {
     public PendingEvent(Event @event)
+        : this(@event, null, null)
+    {
+    }
+
+    public PendingEvent(Event @event, RuntimeEngine? activityProducer, int? activityGeneration)
     {
         Event = @event;
+        ActivityProducer = activityProducer;
+        ActivityGeneration = activityGeneration;
         Completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
     }
 
     public Event Event { get; }
+    public RuntimeEngine? ActivityProducer { get; }
+    public int? ActivityGeneration { get; }
+    public bool HasStaleActivityProducer => ActivityProducer is not null
+        && ActivityGeneration is int generation
+        && !ActivityProducer.IsCurrentActivityGeneration(generation);
     public TaskCompletionSource<bool> Completion { get; }
 }
 
@@ -333,15 +412,27 @@ public class Queue
 
 public abstract class Instance : IInstance
 {
-    internal RuntimeEngine? Engine { get; set; }
+    internal RuntimeEngine? Engine;
+    internal int EngineInstallState;
     private Context? _detachedContext;
 
     public virtual string State => Engine?.State ?? string.Empty;
     public virtual Context Context => Engine?.Context ?? (_detachedContext ??= new Context());
-    public virtual Task Dispatch(Event @event) => Engine?.Dispatch(@event) ?? Task.CompletedTask;
+    public virtual Task Dispatch(Event @event) => Engine?.Dispatch(@event) ?? Task.FromException(new MissingHsmException());
 
-    public virtual Task Stop() => Engine?.StopAsync() ?? Task.CompletedTask;
-    public virtual Task Restart(object? data = null) => Engine?.RestartAsync(data) ?? Task.CompletedTask;
+    public virtual Task Stop() => Engine?.StopAsync() ?? Task.FromException(new MissingHsmException());
+    public virtual Task Restart(object? data = null) => Engine?.RestartAsync(data) ?? Task.FromException(new MissingHsmException());
+    public virtual void OnEventDeferred(Event @event)
+    {
+    }
+
+    public virtual void OnEventRecalled(Event @event)
+    {
+    }
+
+    public virtual void OnRuntimeError(Exception error)
+    {
+    }
 }
 
 public sealed class Group : Instance
@@ -393,10 +484,63 @@ public sealed class Group : Instance
     public IReadOnlyList<IInstance> Instances => _instances;
     public override string State => string.Empty;
     public override Context Context => _context;
-    public override Task Dispatch(Event @event) => Task.WhenAll(_instances.Select(instance => instance.Dispatch(@event)));
+    public override Task Dispatch(Event @event) => Dispatch(null, @event);
+
+    internal Task Dispatch(Context? provenanceContext, Event @event)
+    {
+        if (RuntimeEngine.HasStaleActivityProducer || provenanceContext?.HasStaleActivityProducer == true)
+        {
+            return Task.CompletedTask;
+        }
+
+        var targets = _instances.Where(Runtime.IsStarted).ToArray();
+        var producer = RuntimeEngine.CurrentProducer;
+        if (producer is null)
+        {
+            return DispatchTargets(targets, @event, provenanceContext);
+        }
+
+        var producerInstance = producer.Instance;
+        if (targets.Contains(producerInstance))
+        {
+            producerInstance.Dispatch(@event).GetAwaiter().GetResult();
+        }
+
+        var fanout = DispatchAfterProducer();
+        producer.Context.ScheduleFanout(fanout, producer);
+        return Task.CompletedTask;
+
+        async Task DispatchAfterProducer()
+        {
+            await producer.AfterIdle().ConfigureAwait(false);
+            await DispatchTargets(
+                    targets.Where(instance => !ReferenceEquals(instance, producerInstance)),
+                    @event,
+                    provenanceContext)
+                .ConfigureAwait(false);
+        }
+    }
+
+    private static async Task DispatchTargets(
+        IEnumerable<IInstance> targets,
+        Event @event,
+        Context? provenanceContext)
+    {
+        foreach (var instance in targets)
+        {
+            var outgoing = Runtime.CopyEventForDispatch(@event);
+            await (provenanceContext is not null && instance is Instance concrete && concrete.Engine is not null
+                    ? concrete.Engine.Dispatch(outgoing, provenanceContext)
+                    : instance.Dispatch(outgoing))
+                .ConfigureAwait(false);
+        }
+    }
 
     public override Task Stop() => Task.WhenAll(_instances.Select(instance => instance.Stop()));
     public override Task Restart(object? data = null) => Task.WhenAll(_instances.Select(instance => instance.Restart(data)));
+    internal Task Stop(Context context) => Task.WhenAll(_instances.Select(instance => Runtime.Stop(context, instance)));
+    internal Task Restart(Context context, object? data) =>
+        Task.WhenAll(_instances.Select(instance => Runtime.Restart(context, instance, data)));
 
     internal Snapshot TakeSnapshot() => new()
     {
@@ -425,7 +569,20 @@ internal static class Runtime
         CopyEventSchema(@event.Schema),
         @event.QualifiedName);
 
-    private static object? CopyEventSchema(object? schema) => CopyMutableValue(schema);
+    internal static bool IsStarted(IInstance instance) =>
+        instance is Instance concrete && concrete.Engine?.IsStarted == true;
+
+    internal static object? InvokeOperationReference(
+        Context context,
+        Instance instance,
+        string operationName,
+        Event @event)
+    {
+        var engine = instance.Engine ?? throw new MissingHsmException();
+        return engine.InvokeOperationReference(context, operationName, @event);
+    }
+
+    private static object? CopyEventSchema(object? schema) => schema;
 
     internal static object? CopySnapshotValue(object? value) =>
         CopyValue(value, immutableCollections: true, new Dictionary<object, object?>(ReferenceEqualityComparer.Instance));
@@ -602,13 +759,37 @@ internal static class Runtime
     public static TInstance New<TInstance>(TInstance instance, Model model, Config? config = null)
         where TInstance : Instance
     {
-        if (instance.Engine is not null)
+        if (!RuntimeEngine.TryAcquireActivityLease(null, out _, out _, out var activityLease))
         {
-            throw new AlreadyStartedException();
+            return instance;
         }
+        using (activityLease)
+        {
+            if (Volatile.Read(ref instance.Engine) is not null)
+            {
+                throw new AlreadyStartedException();
+            }
+            if (Interlocked.CompareExchange(ref instance.EngineInstallState, 1, 0) != 0)
+            {
+                throw new AlreadyStartedException();
+            }
+            try
+            {
+                if (Volatile.Read(ref instance.Engine) is not null)
+                {
+                    throw new AlreadyStartedException();
+                }
 
-        instance.Engine = new RuntimeEngine(new Context(), instance, model, config ?? new Config());
-        return instance;
+                Volatile.Write(
+                    ref instance.Engine,
+                    new RuntimeEngine(new Context(), instance, model, config ?? new Config()));
+                return instance;
+            }
+            finally
+            {
+                Volatile.Write(ref instance.EngineInstallState, 0);
+            }
+        }
     }
 
     public static TInstance Start<TInstance>(Context context, TInstance instance, TInstance? _ = null)
@@ -617,25 +798,33 @@ internal static class Runtime
     public static TInstance Start<TInstance>(Context context, TInstance instance, object? data = null)
         where TInstance : Instance
     {
+        if (!RuntimeEngine.TryAcquireActivityLease(context, out _, out _, out var activityLease))
+        {
+            return instance;
+        }
+        using (activityLease)
+        {
+
         if (instance.Engine is null)
         {
-            throw new ValidationException("instance has no bound model");
+            throw new MissingHsmException();
         }
 
-        if (instance.Engine.IsStarted)
-        {
-            throw new AlreadyStartedException();
-        }
-
-        instance.Engine.BindContext(context);
-        context.Register(instance);
-        instance.Engine.Start(data);
+        instance.Engine.Start(context, data);
         return instance;
+        }
     }
 
     public static TInstance Start<TInstance>(Context context, TInstance instance, Model model, Config? config = null)
         where TInstance : Instance
     {
+        if (!RuntimeEngine.TryAcquireActivityLease(context, out _, out _, out var activityLease))
+        {
+            return instance;
+        }
+        using (activityLease)
+        {
+
         if (instance.Engine is not null)
         {
             throw new AlreadyStartedException();
@@ -643,6 +832,7 @@ internal static class Runtime
 
         New(instance, model, config);
         return Start(context, instance, config?.Data);
+        }
     }
 
     public static TInstance Started<TInstance>(Context context, TInstance instance, Model model, Config? config = null)
@@ -650,28 +840,79 @@ internal static class Runtime
 
     public static Task Dispatch(Context context, IInstance? instance, Event @event)
     {
+        if (context.HasStaleActivityProducer)
+        {
+            return Task.CompletedTask;
+        }
+
         if (instance is not null)
         {
-            return instance.Dispatch(@event);
+            return DispatchWithContext(context, instance, @event);
         }
 
         var resolved = FromContext(context);
-        return resolved?.Dispatch(@event) ?? Task.CompletedTask;
+        return resolved is null ? Task.CompletedTask : DispatchWithContext(context, resolved, @event);
     }
 
-    public static Task Stop(Context context, IInstance instance) => instance.Stop();
-    public static Task Restart(Context context, IInstance instance, object? data = null) => instance.Restart(data);
-    public static Task DispatchAll(Context context, Event @event) => Task.WhenAll(context.SnapshotInstances().Select(instance => instance.Dispatch(@event)));
+    public static Task Stop(Context context, IInstance instance) => instance switch
+    {
+        Group group => group.Stop(context),
+        Instance concrete when concrete.Engine is not null => concrete.Engine.StopAsync(context),
+        _ => instance.Stop()
+    };
+    public static Task Restart(Context context, IInstance instance, object? data = null) => instance switch
+    {
+        Group group => group.Restart(context, data),
+        Instance concrete when concrete.Engine is not null => concrete.Engine.RestartAsync(context, data),
+        _ => instance.Restart(data)
+    };
+    public static async Task DispatchAll(Context context, Event @event)
+    {
+        if (context.HasStaleActivityProducer)
+        {
+            return;
+        }
+
+        foreach (var instance in context.SnapshotInstances().Where(IsStarted))
+        {
+            var outgoing = CopyEventForDispatch(@event);
+            outgoing.Target ??= ID(instance);
+            await DispatchWithContext(context, instance, outgoing).ConfigureAwait(false);
+        }
+    }
 
     public static Task DispatchTo(Context context, Event @event, params string[] idPatterns)
     {
+        if (context.HasStaleActivityProducer)
+        {
+            return Task.CompletedTask;
+        }
+
         var targets = context.SnapshotInstances()
+            .Where(IsStarted)
             .Where(instance => idPatterns.Length == 0 || Match(ID(instance), idPatterns))
+            .DistinctBy(instance => ID(instance))
             .ToArray();
-        return targets.Length == 0
-            ? Task.CompletedTask
-            : Task.WhenAll(targets.Select(instance => instance.Dispatch(@event)));
+        return DispatchTargets(context, targets, @event);
     }
+
+    private static async Task DispatchTargets(Context context, IEnumerable<IInstance> targets, Event @event)
+    {
+        foreach (var instance in targets)
+        {
+            var outgoing = CopyEventForDispatch(@event);
+            outgoing.Target ??= ID(instance);
+            await DispatchWithContext(context, instance, outgoing).ConfigureAwait(false);
+        }
+    }
+
+    private static Task DispatchWithContext(Context context, IInstance instance, Event @event) =>
+        instance switch
+        {
+            Group group => group.Dispatch(context, @event),
+            Instance concrete when concrete.Engine is not null => concrete.Engine.Dispatch(@event, context),
+            _ => instance.Dispatch(@event)
+        };
 
     public static T? Get<T>(Context context, IInstance? instance, string attributeName)
     {
@@ -680,7 +921,7 @@ internal static class Runtime
         {
             Group group when group.Instances.Count > 0 => Get<object?>(context, group.Instances[0], attributeName),
             Instance concrete when concrete.Engine is not null => Runtime.CopyMutableValue(concrete.Engine.GetAttribute(attributeName)),
-            _ => null
+            _ => throw new MissingHsmException()
         };
 
         if (value is null)
@@ -702,10 +943,10 @@ internal static class Runtime
                     return;
                 }
             case Instance concrete when concrete.Engine is not null:
-                await concrete.Engine.SetAttributeAsync(attributeName, value);
+                await concrete.Engine.SetAttributeAsync(context, attributeName, value);
                 return;
             default:
-                return;
+                throw new MissingHsmException();
         }
     }
 
@@ -725,13 +966,20 @@ internal static class Runtime
         {
             Group group => group.TakeSnapshot(),
             Instance concrete when concrete.Engine is not null => concrete.Engine.TakeSnapshot(),
-            _ => new Snapshot()
+            _ => throw new MissingHsmException()
         };
 
     public static Task AfterProcess(Context context, IInstance instance, Event? @event = null) =>
         instance is Instance concrete && concrete.Engine is not null
             ? concrete.Engine.AfterProcess(@event)
             : Task.CompletedTask;
+
+    public static Task AfterIdle(Context context, IInstance instance) =>
+        instance is Instance concrete && concrete.Engine is not null
+            ? concrete.Engine.AfterIdle()
+            : Task.CompletedTask;
+
+    public static Task AfterIdle(Context context) => context.DrainFanouts();
 
     public static Task AfterDispatch(Context context, IInstance instance, Event @event) =>
         instance is Instance concrete && concrete.Engine is not null
@@ -840,6 +1088,23 @@ internal static class Runtime
 
 internal sealed class RuntimeEngine
 {
+    private enum LifecycleOperation
+    {
+        None,
+        Stop,
+        RestartExit,
+        RestartEnter
+    }
+
+    private static readonly AsyncLocal<RuntimeEngine?> ActivityProducer = new();
+    private static readonly AsyncLocal<int?> ActivityGeneration = new();
+    private static readonly AsyncLocal<GenerationLease?> ActiveGenerationLease = new();
+    private static readonly AsyncLocal<ExecutionFrame?> Execution = new();
+    internal static RuntimeEngine? CurrentProducer => Execution.Value?.BehaviorProducer;
+    internal static bool HasStaleActivityProducer => ActivityProducer.Value is { } producer
+        && ActivityGeneration.Value is int generation
+        && !producer.IsCurrentActivityGeneration(generation);
+
     private sealed class StateScope
     {
         public StateScope(CancellationTokenSource cancellation)
@@ -848,7 +1113,60 @@ internal sealed class RuntimeEngine
         }
 
         public CancellationTokenSource Cancellation { get; }
+        public List<CancellationTokenSource> Activities { get; } = [];
     }
+
+    internal sealed class GenerationLease : IDisposable
+    {
+        private readonly GenerationLease? _previous;
+        private readonly GenerationLease _root;
+        private bool _disposed;
+        private bool _active;
+
+        internal GenerationLease(RuntimeEngine owner, int generation, GenerationLease? previous)
+        {
+            Owner = owner;
+            Generation = generation;
+            _previous = previous;
+            _root = previous is not null
+                && ReferenceEquals(previous.Owner, owner)
+                && previous.Generation == generation
+                && previous._root.IsActive
+                    ? previous._root
+                    : this;
+            if (ReferenceEquals(_root, this)) _active = true;
+        }
+
+        internal RuntimeEngine Owner { get; }
+        internal int Generation { get; }
+        internal bool IsActive => _root._active;
+        internal bool IsRoot => ReferenceEquals(_root, this);
+
+        internal void Retire()
+        {
+            _root._active = false;
+        }
+
+        public void Dispose()
+        {
+            if (_disposed) return;
+            _disposed = true;
+            ActiveGenerationLease.Value = _previous;
+            if (IsRoot) Owner.ReleaseGenerationLease(this);
+        }
+    }
+
+    private readonly record struct ExecutionFrame(
+        RuntimeEngine Owner,
+        RuntimeEngine? BehaviorProducer,
+        int OperationDepth,
+        string? ResolutionScope);
+
+    private sealed record GeneratedCall(
+        Event Event,
+        int LifecycleVersion,
+        RuntimeEngine? ActivityProducer,
+        int? ActivityGeneration);
 
     private sealed class ObserverRegistry
     {
@@ -861,8 +1179,14 @@ internal sealed class RuntimeEngine
     }
 
     private readonly object _gate = new();
+    private readonly object _lifecycleGate = new();
+    private readonly object _generationGate = new();
     private readonly Queue _queue;
     private readonly List<PendingEvent> _deferred = new();
+    private readonly HashSet<PendingEvent> _deferredQueued = new(ReferenceEqualityComparer.Instance);
+    private readonly Dictionary<PendingEvent, string> _deferredOwners = new(ReferenceEqualityComparer.Instance);
+    private readonly HashSet<PendingEvent> _discardedDeferred = new(ReferenceEqualityComparer.Instance);
+    private readonly List<GeneratedCall> _generatedCalls = new();
     private readonly Dictionary<string, object?> _attributes = new(StringComparer.Ordinal);
     private readonly Dictionary<string, StateScope> _activeScopes = new(StringComparer.Ordinal);
     private readonly Dictionary<string, string> _historyShallow = new(StringComparer.Ordinal);
@@ -874,7 +1198,26 @@ internal sealed class RuntimeEngine
     private bool _processing;
     private TaskCompletionSource<bool>? _processingCompletion;
     private int? _processingThreadId;
+    private bool _pauseAfterDeferred;
+    private bool _rebuildDeferredQueue;
+    private bool _skipDeferredReplay;
+    private volatile int _lifecycleVersion;
+    private int _activeGenerationLeases;
+    private bool _generationRetiring;
+    private volatile LifecycleOperation _lifecycleOperation;
+    private LifecycleOperation _requestedLifecycleOperation;
+    private object? _requestedLifecycleData;
+    private bool _requestedLifecycleRetired;
     private State _currentState;
+
+    private int CurrentOperationDepth => Execution.Value is { } execution
+        && ReferenceEquals(execution.Owner, this)
+            ? execution.OperationDepth
+            : 0;
+    private string? CurrentResolutionScope => Execution.Value is { } execution
+        && ReferenceEquals(execution.Owner, this)
+            ? execution.ResolutionScope
+            : null;
 
     public RuntimeEngine(Context context, Instance instance, Model model, Config config)
     {
@@ -887,9 +1230,7 @@ internal sealed class RuntimeEngine
 
         QualifiedName = string.IsNullOrWhiteSpace(config.Name)
             ? model.QualifiedName
-            : config.Name!.StartsWith("/", StringComparison.Ordinal)
-                ? PathUtil.Join(config.Name)
-                : PathUtil.Join("/", config.Name);
+            : config.Name!;
 
         var simpleName = PathUtil.Name(QualifiedName);
         ID = string.IsNullOrWhiteSpace(config.Id)
@@ -900,67 +1241,182 @@ internal sealed class RuntimeEngine
     }
 
     public Context Context { get; private set; }
+    internal Instance Instance => _instance;
     public string ID { get; }
     public string QualifiedName { get; }
-    public string State => _currentState.QualifiedName;
+    public string State => IsStarted ? _currentState.QualifiedName : string.Empty;
     public bool IsStarted { get; private set; }
+
+    private ExecutionFrame? PushExecution(RuntimeEngine? behaviorProducer, string? resolutionScope, int depthDelta = 0)
+    {
+        var previous = Execution.Value;
+        var sameOwner = previous is { } execution && ReferenceEquals(execution.Owner, this);
+        Execution.Value = new ExecutionFrame(
+            this,
+            behaviorProducer,
+            (sameOwner ? previous!.Value.OperationDepth : 0) + depthDelta,
+            resolutionScope ?? (sameOwner ? previous!.Value.ResolutionScope : null));
+        return previous;
+    }
+
+    private static void RestoreExecution(ExecutionFrame? previous) => Execution.Value = previous;
+
+    internal void ReportAsyncError(Exception error)
+    {
+        try
+        {
+            _instance.OnRuntimeError(error);
+        }
+        catch
+        {
+        }
+
+        if (IsStarted) _ = Dispatch(new ErrorEvent(error));
+    }
 
     private Clock Clock => _config.Clock ?? Runtime.DefaultClock;
 
-    public void BindContext(Context context) => Context = context;
-
-    public void Start(object? data)
+    public void Start(Context context, object? data)
     {
-        if (IsStarted)
+        if (!TryAcquireActivityLease(context, out _, out _, out var activityLease))
         {
-            throw new AlreadyStartedException();
+            return;
         }
+        using (activityLease)
+        {
+        lock (_lifecycleGate)
+        {
+            if (IsStarted)
+            {
+                throw new AlreadyStartedException();
+            }
 
-        IsStarted = true;
-        _currentState = EnterVertex(_model, new InitialEvent(data), true);
+            Context = context;
+            Context.Register(_instance);
+            _queue.Clear();
+            _deferred.Clear();
+            _deferredQueued.Clear();
+            _deferredOwners.Clear();
+            _discardedDeferred.Clear();
+            _generatedCalls.Clear();
+            _historyShallow.Clear();
+            _historyDeep.Clear();
+            ResetAttributes();
+            IsStarted = true;
+            BeginInlineProcessing();
+            try
+            {
+                _currentState = EnterVertex(_model, new InitialEvent(data), true);
+            }
+            catch (Exception error)
+            {
+                _instance.OnRuntimeError(error);
+                _queue.Push(Context, new PendingEvent(new ErrorEvent(error)));
+            }
+
+            ProcessQueueWorker();
+        }
+        }
     }
 
     public Task Dispatch(Event @event)
     {
-        return DispatchCore(@event);
+        return DispatchCore(@event, deferActivityProducer: false);
     }
 
-    private Task DispatchCore(Event @event)
+    internal Task Dispatch(Event @event, Context provenanceContext) => DispatchCore(
+        @event,
+        deferActivityProducer: false,
+        provenanceContext.ActivityProducer,
+        provenanceContext.ActivityGeneration);
+
+    private Task DispatchCore(
+        Event @event,
+        bool deferActivityProducer,
+        RuntimeEngine? activityProducer = null,
+        int? activityGeneration = null)
     {
-        if (!IsStarted || Context.IsDone)
+        activityProducer ??= ActivityProducer.Value;
+        activityGeneration ??= ActivityGeneration.Value;
+        if (activityProducer is not null
+            && activityGeneration is int generation
+            && !activityProducer.IsCurrentActivityGeneration(generation))
         {
             return Task.CompletedTask;
         }
 
+        if (_lifecycleOperation is LifecycleOperation.Stop or LifecycleOperation.RestartExit
+            && (Monitor.IsEntered(_lifecycleGate) || ReferenceEquals(CurrentProducer, this)))
+        {
+            return Task.CompletedTask;
+        }
+
+        if (!IsStarted || Context.IsDone)
+        {
+            return !IsStarted
+                ? Task.FromException(new HsmRuntimeException("dispatch requires a started HSM"))
+                : Task.CompletedTask;
+        }
+
         PendingEvent pending;
         var startProcessor = false;
+        var processInline = false;
         Task processingTask;
         lock (_gate)
         {
-            pending = new PendingEvent(Runtime.CopyEventForDispatch(@event));
+            pending = new PendingEvent(
+                Runtime.CopyEventForDispatch(@event),
+                activityProducer,
+                activityGeneration);
             var error = _queue.Push(Context, pending);
             if (error is not null && !@event.Kind.IsCompletionPriority())
             {
-                _queue.Push(Context, new PendingEvent(new ErrorEvent(error)));
+                _queue.Push(Context, new PendingEvent(new ErrorEvent(error), activityProducer, activityGeneration));
             }
 
             Notify(_observers?.Dispatched, @event.Name);
+            if (_lifecycleOperation == LifecycleOperation.RestartEnter
+                && (Monitor.IsEntered(_lifecycleGate) || ReferenceEquals(CurrentProducer, this)))
+            {
+                if (!_processing)
+                {
+                    _processing = true;
+                    _processingCompletion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                    _ = Task.Run(ProcessQueueWorker);
+                }
+                return Task.CompletedTask;
+            }
+            if (deferActivityProducer && ReferenceEquals(ActivityProducer.Value, this))
+            {
+                return Task.CompletedTask;
+            }
+
             if (_processing)
             {
                 if (_processingThreadId == Environment.CurrentManagedThreadId)
                 {
+                    processInline = CurrentOperationDepth > 0;
+                    processingTask = Task.CompletedTask;
+                }
+                else if (ReferenceEquals(CurrentProducer, this) && ActivityProducer.Value is null)
+                {
                     return Task.CompletedTask;
                 }
-
-                return _processingCompletion?.Task ?? Task.CompletedTask;
+                else
+                {
+                    return _processingCompletion?.Task ?? Task.CompletedTask;
+                }
             }
-
-            _processing = true;
-            _processingCompletion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-            processingTask = _processingCompletion.Task;
-            startProcessor = true;
+            else
+            {
+                _processing = true;
+                _processingCompletion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                processingTask = _processingCompletion.Task;
+                startProcessor = true;
+            }
         }
 
+        if (processInline) ProcessPendingInline();
         if (startProcessor)
         {
             _ = Task.Run(ProcessQueueWorker);
@@ -969,72 +1425,348 @@ internal sealed class RuntimeEngine
         return processingTask;
     }
 
-    public Task StopAsync()
+    public Task StopAsync() => StopAsync(null, generationRetired: false, allowBlocking: false);
+
+    internal Task StopAsync(Context context) => StopAsync(context, generationRetired: false, allowBlocking: false);
+
+    private Task StopAsync(Context? provenanceContext, bool generationRetired, bool allowBlocking)
     {
-        if (!IsStarted)
+        if (!TryAcquireActivityLease(provenanceContext, out _, out _, out var activityLease))
         {
             return Task.CompletedTask;
         }
+        using (activityLease)
+        {
+        if (IsAsyncBehaviorContinuation)
+        {
+            return RequestLifecycleOperation(LifecycleOperation.Stop, null);
+        }
 
+        if (!generationRetired && !allowBlocking && MustWaitForGenerationLeases())
+        {
+            return Task.Run(() => StopAsync(provenanceContext, generationRetired: false, allowBlocking: true));
+        }
+        if (!generationRetired) RetireActivityGeneration();
+
+        Task processingTask;
+        var ownsProcessing = false;
+        var calledByProcessor = false;
+        lock (_lifecycleGate)
+        {
+            if (_lifecycleOperation != LifecycleOperation.None)
+            {
+                return Task.CompletedTask;
+            }
+            if (!IsStarted)
+            {
+                return Task.FromException(new HsmRuntimeException("stop requires a started HSM"));
+            }
+
+            _lifecycleOperation = LifecycleOperation.Stop;
+            try
+            {
+                lock (_gate)
+                {
+                    ownsProcessing = !_processing;
+                    calledByProcessor = _processingThreadId == Environment.CurrentManagedThreadId;
+                }
+                if (ownsProcessing) BeginInlineProcessing();
+
+                ExitToAncestor(_currentState.QualifiedName, _model.QualifiedName, new CompletionEvent(CompletionEvent.EventName));
+                CancelScopes();
+                lock (_gate)
+                {
+                    _queue.Clear();
+                    _deferred.Clear();
+                    _deferredQueued.Clear();
+                    _deferredOwners.Clear();
+                    _discardedDeferred.Clear();
+                    _generatedCalls.Clear();
+                    _historyShallow.Clear();
+                    _historyDeep.Clear();
+                    _pauseAfterDeferred = false;
+                    _rebuildDeferredQueue = false;
+                    _skipDeferredReplay = false;
+                    ResetAttributes();
+                    _currentState = _model;
+                    IsStarted = false;
+                    processingTask = _processingCompletion?.Task ?? Task.CompletedTask;
+                }
+                Context.Unregister(_instance);
+            }
+            finally
+            {
+                _lifecycleOperation = LifecycleOperation.None;
+            }
+        }
+
+        if (ownsProcessing) ProcessQueueWorker();
+        return calledByProcessor ? Task.CompletedTask : processingTask;
+        }
+    }
+
+    public Task RestartAsync(object? data) => RestartAsync(data, null, generationRetired: false, allowBlocking: false);
+
+    internal Task RestartAsync(Context context, object? data) =>
+        RestartAsync(data, context, generationRetired: false, allowBlocking: false);
+
+    private Task RestartAsync(object? data, Context? provenanceContext, bool generationRetired, bool allowBlocking)
+    {
+        if (!TryAcquireActivityLease(provenanceContext, out _, out _, out var activityLease))
+        {
+            return Task.CompletedTask;
+        }
+        using (activityLease)
+        {
+        if (IsAsyncBehaviorContinuation)
+        {
+            return RequestLifecycleOperation(LifecycleOperation.RestartExit, data);
+        }
+
+        if (!generationRetired && !allowBlocking && MustWaitForGenerationLeases())
+        {
+            return Task.Run(() => RestartAsync(data, provenanceContext, generationRetired: false, allowBlocking: true));
+        }
+        if (!generationRetired) RetireActivityGeneration();
+
+        Task processingTask;
+        var ownsProcessing = false;
+        var calledByProcessor = false;
+        lock (_lifecycleGate)
+        {
+            if (_lifecycleOperation != LifecycleOperation.None)
+            {
+                return Task.CompletedTask;
+            }
+            if (!IsStarted)
+            {
+                return Task.FromException(new HsmRuntimeException("restart requires a started HSM"));
+            }
+
+            _lifecycleOperation = LifecycleOperation.RestartExit;
+            try
+            {
+                lock (_gate)
+                {
+                    _queue.Clear();
+                    _deferred.Clear();
+                    _deferredQueued.Clear();
+                    _deferredOwners.Clear();
+                    _discardedDeferred.Clear();
+                    _generatedCalls.Clear();
+                    _pauseAfterDeferred = false;
+                    _rebuildDeferredQueue = false;
+                    _skipDeferredReplay = false;
+                    ownsProcessing = !_processing;
+                    calledByProcessor = _processingThreadId == Environment.CurrentManagedThreadId;
+                }
+                if (ownsProcessing) BeginInlineProcessing();
+
+                ExitToAncestor(_currentState.QualifiedName, _model.QualifiedName, new CompletionEvent(CompletionEvent.EventName));
+                CancelScopes();
+                _historyShallow.Clear();
+                _historyDeep.Clear();
+                ResetAttributes();
+                _lifecycleOperation = LifecycleOperation.RestartEnter;
+                _currentState = EnterVertex(_model, new InitialEvent(data), true);
+            }
+            catch (Exception error)
+            {
+                _queue.Push(Context, new PendingEvent(new ErrorEvent(error)));
+            }
+            finally
+            {
+                _lifecycleOperation = LifecycleOperation.None;
+            }
+
+            lock (_gate) processingTask = _processingCompletion?.Task ?? Task.CompletedTask;
+        }
+
+        if (ownsProcessing) ProcessQueueWorker();
+
+        return calledByProcessor ? Task.CompletedTask : processingTask;
+        }
+    }
+
+    private bool IsAsyncBehaviorContinuation =>
+        ReferenceEquals(CurrentProducer, this)
+        && ActivityProducer.Value is null
+        && _processing
+        && _processingThreadId != Environment.CurrentManagedThreadId;
+
+    private Task RequestLifecycleOperation(LifecycleOperation operation, object? data)
+    {
+        var applyDirectly = false;
         lock (_gate)
         {
-            ExitToAncestor(_currentState.QualifiedName, _model.QualifiedName, new CompletionEvent("hsm.final"));
-            CancelScopes();
-            Context.Cancel();
+            if (_lifecycleOperation != LifecycleOperation.None || _requestedLifecycleOperation != LifecycleOperation.None)
+            {
+                return Task.CompletedTask;
+            }
+            if (!IsStarted)
+            {
+                return Task.FromException(new HsmRuntimeException(
+                    operation == LifecycleOperation.Stop
+                        ? "stop requires a started HSM"
+                        : "restart requires a started HSM"));
+            }
+            if (!_processing)
+            {
+                applyDirectly = true;
+            }
+            else
+            {
+                RetireActivityGeneration();
+                _requestedLifecycleOperation = operation;
+                _requestedLifecycleData = data;
+                _requestedLifecycleRetired = true;
+            }
+        }
+
+        if (applyDirectly)
+        {
+            var previousExecution = Execution.Value;
+            Execution.Value = null;
+            try
+            {
+                return operation == LifecycleOperation.Stop
+                    ? StopAsync()
+                    : RestartAsync(data);
+            }
+            finally
+            {
+                Execution.Value = previousExecution;
+            }
         }
 
         return Task.CompletedTask;
     }
 
-    public Task RestartAsync(object? data)
+    private void ApplyRequestedLifecycleOperation()
     {
-        if (!IsStarted)
-        {
-            return Task.CompletedTask;
-        }
-
+        LifecycleOperation operation;
+        object? data;
+        bool generationRetired;
         lock (_gate)
         {
-            ExitToAncestor(_currentState.QualifiedName, _model.QualifiedName, new CompletionEvent("hsm.final"));
-            CancelScopes();
-            _queue.Clear();
-            _deferred.Clear();
-            _historyShallow.Clear();
-            _historyDeep.Clear();
-            ResetAttributes();
-            _currentState = EnterVertex(_model, new InitialEvent(data), true);
+            operation = _requestedLifecycleOperation;
+            data = _requestedLifecycleData;
+            generationRetired = _requestedLifecycleRetired;
+            _requestedLifecycleOperation = LifecycleOperation.None;
+            _requestedLifecycleData = null;
+            _requestedLifecycleRetired = false;
         }
 
-        return Task.CompletedTask;
+        if (operation == LifecycleOperation.None || !IsStarted)
+        {
+            return;
+        }
+
+        var previousActivityProducer = ActivityProducer.Value;
+        var previousActivityGeneration = ActivityGeneration.Value;
+        var previousExecution = Execution.Value;
+        ActivityProducer.Value = null;
+        ActivityGeneration.Value = null;
+        Execution.Value = null;
+        try
+        {
+            if (operation == LifecycleOperation.Stop)
+            {
+                StopAsync(null, generationRetired, allowBlocking: true).GetAwaiter().GetResult();
+            }
+            else
+            {
+                RestartAsync(data, null, generationRetired, allowBlocking: true).GetAwaiter().GetResult();
+            }
+        }
+        finally
+        {
+            ActivityProducer.Value = previousActivityProducer;
+            ActivityGeneration.Value = previousActivityGeneration;
+            Execution.Value = previousExecution;
+        }
+    }
+
+    private void BeginInlineProcessing()
+    {
+        lock (_gate)
+        {
+            _processing = true;
+            _processingThreadId = Environment.CurrentManagedThreadId;
+            _processingCompletion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        }
+    }
+
+    public void ProcessPendingInline()
+    {
+        if (ReferenceEquals(ActivityProducer.Value, this))
+        {
+            return;
+        }
+
+        if (!_processing || _processingThreadId != Environment.CurrentManagedThreadId)
+        {
+            return;
+        }
+
+        if (CurrentResolutionScope is not null
+            && !PathUtil.IsDescendantOrSelf(_currentState.QualifiedName, CurrentResolutionScope))
+        {
+            return;
+        }
+
+        ProcessQueueWorker();
+        BeginInlineProcessing();
     }
 
     public object? GetAttribute(string attributeName)
     {
-        var qualifiedName = QualifyAttribute(attributeName);
-        _attributes.TryGetValue(qualifiedName, out var value);
-        return value;
-    }
-
-    public async Task SetAttributeAsync(string attributeName, object? value)
-    {
-        if (string.IsNullOrWhiteSpace(attributeName))
+        if (!IsStarted)
         {
-            throw new ValidationException("attribute name cannot be empty");
+            throw new HsmRuntimeException("get requires a started HSM");
         }
 
         var qualifiedName = QualifyAttribute(attributeName);
         if (!IsKnownAttribute(qualifiedName))
         {
+            throw new AttributeHsmException($"unknown attribute '{attributeName}'");
+        }
+
+        _attributes.TryGetValue(qualifiedName, out var value);
+        return value;
+    }
+
+    public async Task SetAttributeAsync(Context callingContext, string attributeName, object? value)
+    {
+        if (!TryAcquireActivityLease(callingContext, out _, out _, out var activityLease))
+        {
             return;
+        }
+        using (activityLease)
+        {
+
+        if (!IsStarted)
+        {
+            throw new HsmRuntimeException("set requires a started HSM");
+        }
+
+        if (string.IsNullOrWhiteSpace(attributeName))
+        {
+            throw new AttributeHsmException("attribute name cannot be empty");
+        }
+
+        var qualifiedName = QualifyAttribute(attributeName);
+        if (!IsKnownAttribute(qualifiedName))
+        {
+            throw new AttributeHsmException($"unknown attribute '{attributeName}'");
         }
 
         if (_model.Attributes.TryGetValue(qualifiedName, out var attribute)
-            && attribute.HasDefault
-            && attribute.DefaultValue is not null
+            && attribute.ValueType != typeof(object)
             && value is not null
-            && value.GetType() != attribute.DefaultValue.GetType())
+            && !IsCompatibleAttributeValue(attribute.ValueType, value))
         {
-            return;
+            throw new AttributeHsmException($"attribute '{attributeName}' has an incompatible value");
         }
 
         var hadValue = _attributes.TryGetValue(qualifiedName, out var previous);
@@ -1050,11 +1782,24 @@ internal sealed class RuntimeEngine
             Old = hadValue ? previous : null,
             New = value
         };
-        await Dispatch(new Event(qualifiedName, Kind.ChangeEvent, change, qualifiedName));
+        await DispatchCore(
+            new Event(qualifiedName, Kind.ChangeEvent, change, qualifiedName),
+            deferActivityProducer: ReferenceEquals(callingContext.ActivityProducer, this));
+        }
     }
+
+    internal static bool IsCompatibleAttributeValue(Type expected, object value) =>
+        expected.IsInstanceOfType(value)
+        || (expected == typeof(double)
+            && value is sbyte or byte or short or ushort or int or uint or long or ulong or float or double or decimal);
 
     public object? CallOperation(Context context, string operationName, params object?[] args)
     {
+        if (!IsStarted)
+        {
+            throw new HsmRuntimeException("operation requires a started HSM");
+        }
+
         if (string.IsNullOrWhiteSpace(operationName))
         {
             throw new InvalidOperationSignatureException(operationName);
@@ -1066,17 +1811,251 @@ internal sealed class RuntimeEngine
             throw new MissingOperationException(qualifiedName);
         }
 
+        if (!TryAcquireActivityLease(
+                context,
+                out var activityProducer,
+                out var activityGeneration,
+                out var activityLease))
+        {
+            return null;
+        }
+        var leaseTransferred = false;
+        try
+        {
+
         var eventData = new CallData
         {
             Name = qualifiedName,
             Args = args
         };
-        Dispatch(new Event(qualifiedName, Kind.CallEvent, eventData, qualifiedName)).GetAwaiter().GetResult();
-        return InvokeOperation(operation, context, args);
+        bool ownsProcessing;
+        bool calledByProcessor;
+        lock (_gate)
+        {
+            ownsProcessing = !_processing;
+            calledByProcessor = _processingThreadId == Environment.CurrentManagedThreadId
+                || ReferenceEquals(CurrentProducer, this) && ActivityProducer.Value is null;
+        }
+
+        if (ownsProcessing)
+        {
+            BeginInlineProcessing();
+        }
+
+        var lifecycleVersion = _lifecycleVersion;
+        object? result;
+        try
+        {
+            var previousExecution = PushExecution(this, operation.ResolutionScope, depthDelta: 1);
+            try
+            {
+                result = InvokeOperation(operation, context, args, eventData);
+            }
+            finally
+            {
+                RestoreExecution(previousExecution);
+            }
+            var callEvent = new Event(qualifiedName, Kind.CallEvent, eventData, qualifiedName);
+            if (IsAsyncOperationResult(result))
+            {
+                leaseTransferred = true;
+                return CompleteAsyncOperation(
+                    result!,
+                    callEvent,
+                    lifecycleVersion,
+                    activityProducer,
+                    activityGeneration,
+                    ownsProcessing,
+                    calledByProcessor,
+                    activityLease);
+            }
+            EnqueueCallEvent(
+                    callEvent,
+                    lifecycleVersion,
+                    activityProducer,
+                    activityGeneration,
+                    waitForProcessing: !ownsProcessing && !calledByProcessor,
+                    deferGenerated: calledByProcessor)
+                .GetAwaiter().GetResult();
+        }
+        catch
+        {
+            if (ownsProcessing)
+            {
+                ProcessQueueWorker();
+            }
+
+            throw;
+        }
+
+        if (ownsProcessing)
+        {
+            ProcessQueueWorker();
+        }
+
+        return result;
+        }
+        finally
+        {
+            if (!leaseTransferred) activityLease?.Dispose();
+        }
+    }
+
+    private static bool IsAsyncOperationResult(object? result)
+    {
+        if (result is Task or ValueTask)
+        {
+            return true;
+        }
+
+        var type = result?.GetType();
+        return type is not null
+            && type.IsGenericType
+            && type.GetGenericTypeDefinition() == typeof(ValueTask<>);
+    }
+
+    private async Task<object?> CompleteAsyncOperation(
+        object result,
+        Event callEvent,
+        int lifecycleVersion,
+        RuntimeEngine? activityProducer,
+        int? activityGeneration,
+        bool ownsProcessing,
+        bool calledByProcessor,
+        GenerationLease? activityLease)
+    {
+        try
+        {
+            var value = await AwaitOperationResult(result).ConfigureAwait(false);
+            await EnqueueCallEvent(
+                    callEvent,
+                    lifecycleVersion,
+                    activityProducer,
+                    activityGeneration,
+                    waitForProcessing: !ownsProcessing && !calledByProcessor,
+                    deferGenerated: calledByProcessor)
+                .ConfigureAwait(false);
+            return value;
+        }
+        finally
+        {
+            activityLease?.Dispose();
+            if (ownsProcessing)
+            {
+                ProcessQueueWorker();
+            }
+        }
+    }
+
+    private static async Task<object?> AwaitOperationResult(object result)
+    {
+        if (result is Task task)
+        {
+            await task.ConfigureAwait(false);
+            return task.GetType().IsGenericType
+                ? task.GetType().GetProperty("Result")?.GetValue(task)
+                : null;
+        }
+        if (result is ValueTask valueTask)
+        {
+            await valueTask.ConfigureAwait(false);
+            return null;
+        }
+
+        var asTask = result.GetType().GetMethod("AsTask", Type.EmptyTypes)
+            ?? throw new InvalidOperationSignatureException("operation result");
+        var genericTask = (Task)asTask.Invoke(result, null)!;
+        await genericTask.ConfigureAwait(false);
+        return genericTask.GetType().GetProperty("Result")?.GetValue(genericTask);
+    }
+
+    private Task EnqueueCallEvent(
+        Event callEvent,
+        int lifecycleVersion,
+        RuntimeEngine? activityProducer,
+        int? activityGeneration,
+        bool waitForProcessing,
+        bool deferGenerated)
+    {
+        var startProcessor = false;
+        Task processingTask;
+        lock (_gate)
+        {
+            if (lifecycleVersion != _lifecycleVersion
+                || !IsStarted
+                || activityProducer is not null
+                    && activityGeneration is int generation
+                    && !activityProducer.IsCurrentActivityGeneration(generation))
+            {
+                return waitForProcessing
+                    ? _processingCompletion?.Task ?? Task.CompletedTask
+                    : Task.CompletedTask;
+            }
+
+            if (deferGenerated && _processing)
+            {
+                _generatedCalls.Add(new GeneratedCall(
+                    callEvent,
+                    lifecycleVersion,
+                    activityProducer,
+                    activityGeneration));
+                return Task.CompletedTask;
+            }
+
+            var error = _queue.Push(Context, new PendingEvent(callEvent, activityProducer, activityGeneration));
+            if (error is not null)
+            {
+                _queue.Push(Context, new PendingEvent(new ErrorEvent(error), activityProducer, activityGeneration));
+            }
+            Notify(_observers?.Dispatched, callEvent.Name);
+
+            if (_processing)
+            {
+                processingTask = _processingCompletion?.Task ?? Task.CompletedTask;
+            }
+            else
+            {
+                _processing = true;
+                _processingCompletion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                processingTask = _processingCompletion.Task;
+                startProcessor = true;
+            }
+        }
+
+        if (startProcessor)
+        {
+            _ = Task.Run(ProcessQueueWorker);
+        }
+        return waitForProcessing ? processingTask : Task.CompletedTask;
+    }
+
+    internal object? InvokeOperationReference(Context context, string operationName, Event @event)
+    {
+        var qualifiedName = QualifyOperation(operationName);
+        if (!_model.Operations.TryGetValue(qualifiedName, out var operation))
+        {
+            throw new MissingOperationException(qualifiedName);
+        }
+
+        var callData = new CallData { Name = qualifiedName, Args = [@event] };
+        var previousExecution = PushExecution(CurrentProducer, operation.ResolutionScope, depthDelta: 1);
+        try
+        {
+            return InvokeOperation(operation, context, [@event], callData);
+        }
+        finally
+        {
+            RestoreExecution(previousExecution);
+        }
     }
 
     public Snapshot TakeSnapshot()
     {
+        if (!IsStarted)
+        {
+            throw new HsmRuntimeException("take snapshot requires a started HSM");
+        }
+
         ReadOnlyDictionary<string, object?> attributes;
         int queueLen;
         string currentState;
@@ -1131,6 +2110,13 @@ internal sealed class RuntimeEngine
         @event is null
             ? RegisterWaiter(null, registry => registry.Cycles, null)
             : RegisterWaiter(@event.Name, null, registry => registry.Processed);
+    public Task AfterIdle()
+    {
+        lock (_gate)
+        {
+            return _processingCompletion?.Task ?? Task.CompletedTask;
+        }
+    }
     public Task AfterDispatch(Event @event) => RegisterWaiter(@event.Name, null, registry => registry.Dispatched);
     public Task AfterEntry(string statePath) => RegisterWaiter(PathUtil.Join(statePath), null, registry => registry.Entered);
     public Task AfterExit(string statePath) => RegisterWaiter(PathUtil.Join(statePath), null, registry => registry.Exited);
@@ -1189,11 +2175,107 @@ internal sealed class RuntimeEngine
     {
         foreach (var scope in _activeScopes.Values)
         {
+            foreach (var activity in scope.Activities)
+            {
+                activity.Cancel();
+                activity.Dispose();
+            }
             scope.Cancellation.Cancel();
             scope.Cancellation.Dispose();
         }
 
         _activeScopes.Clear();
+    }
+
+    internal bool IsCurrentActivityGeneration(int generation) => generation == _lifecycleVersion;
+
+    internal GenerationLease? TryAcquireGenerationLease(int generation)
+    {
+        var previous = ActiveGenerationLease.Value;
+        if (previous is not null
+            && ReferenceEquals(previous.Owner, this)
+            && previous.Generation == generation
+            && previous.IsActive)
+        {
+            var nested = new GenerationLease(this, generation, previous);
+            ActiveGenerationLease.Value = nested;
+            return nested;
+        }
+
+        lock (_generationGate)
+        {
+            if (_generationRetiring || generation != _lifecycleVersion)
+            {
+                return null;
+            }
+
+            _activeGenerationLeases++;
+            var lease = new GenerationLease(this, generation, previous);
+            ActiveGenerationLease.Value = lease;
+            return lease;
+        }
+    }
+
+    private void ReleaseGenerationLease(GenerationLease lease)
+    {
+        lock (_generationGate)
+        {
+            if (!lease.IsActive) return;
+            lease.Retire();
+            _activeGenerationLeases--;
+            if (_activeGenerationLeases == 0) Monitor.PulseAll(_generationGate);
+        }
+    }
+
+    private void RetireActivityGeneration()
+    {
+        lock (_generationGate)
+        {
+            while (_generationRetiring) Monitor.Wait(_generationGate);
+            _generationRetiring = true;
+
+            var current = ActiveGenerationLease.Value;
+            if (current is not null
+                && ReferenceEquals(current.Owner, this)
+                && current.Generation == _lifecycleVersion
+                && current.IsActive)
+            {
+                current.Retire();
+                _activeGenerationLeases--;
+            }
+
+            while (_activeGenerationLeases > 0) Monitor.Wait(_generationGate);
+            _lifecycleVersion++;
+            _generationRetiring = false;
+            Monitor.PulseAll(_generationGate);
+        }
+    }
+
+    private bool MustWaitForGenerationLeases()
+    {
+        lock (_generationGate)
+        {
+            var current = ActiveGenerationLease.Value;
+            return _activeGenerationLeases > 0
+                && !(current is not null
+                    && ReferenceEquals(current.Owner, this)
+                    && current.Generation == _lifecycleVersion
+                    && current.IsActive);
+        }
+    }
+
+    internal static bool TryAcquireActivityLease(
+        Context? context,
+        out RuntimeEngine? producer,
+        out int? generation,
+        out GenerationLease? lease)
+    {
+        producer = context?.ActivityProducer ?? ActivityProducer.Value;
+        generation = context?.ActivityGeneration ?? ActivityGeneration.Value;
+        lease = null;
+        if (producer is null || generation is not int value) return true;
+        lease = producer.TryAcquireGenerationLease(value);
+        return lease is not null;
     }
 
     private void ProcessQueueWorker()
@@ -1205,9 +2287,14 @@ internal sealed class RuntimeEngine
                 _processingThreadId = Environment.CurrentManagedThreadId;
             }
 
+            ApplyRequestedLifecycleOperation();
+            FlushGeneratedCalls();
+
             while (true)
             {
+                FlushGeneratedCalls();
                 PendingEvent? pending;
+                int lifecycleVersion;
                 lock (_gate)
                 {
                     var (nextPending, error) = _queue.Pop(Context);
@@ -1218,8 +2305,14 @@ internal sealed class RuntimeEngine
                     }
 
                     pending = nextPending;
+                    lifecycleVersion = _lifecycleVersion;
                     if (pending is null)
                     {
+                        if (_generatedCalls.Count > 0)
+                        {
+                            continue;
+                        }
+
                         var completion = _processingCompletion;
                         _processing = false;
                         _processingCompletion = null;
@@ -1230,14 +2323,42 @@ internal sealed class RuntimeEngine
                 }
 
                 bool stateChanged;
-                try
+                GenerationLease? activityLease = null;
+                var staleActivity = pending.ActivityProducer is not null
+                    && pending.ActivityGeneration is int activityGeneration
+                    && (activityLease = pending.ActivityProducer.TryAcquireGenerationLease(activityGeneration)) is null;
+                using (activityLease)
                 {
-                    stateChanged = ProcessEvent(pending);
-                }
-                catch
+                lock (_lifecycleGate)
                 {
-                    throw;
+                    if (lifecycleVersion != _lifecycleVersion || !IsStarted || staleActivity)
+                    {
+                        pending.Completion.TrySetResult(true);
+                        stateChanged = false;
+                    }
+                    else
+                    {
+                        try
+                        {
+                            stateChanged = ProcessEvent(pending);
+                        }
+                        catch (Exception error)
+                        {
+                            _instance.OnRuntimeError(error);
+                            pending.Completion.TrySetResult(true);
+                            lock (_gate)
+                            {
+                                _queue.Push(Context, new PendingEvent(new ErrorEvent(error)));
+                            }
+
+                            stateChanged = false;
+                        }
+                    }
                 }
+                }
+
+                ApplyRequestedLifecycleOperation();
+                FlushGeneratedCalls();
 
                 if (pending.Completion.Task.IsCompleted)
                 {
@@ -1245,9 +2366,37 @@ internal sealed class RuntimeEngine
                     NotifyCycles();
                 }
 
-                if (stateChanged)
+                if (_skipDeferredReplay)
                 {
-                    ReplayDeferred();
+                    _skipDeferredReplay = false;
+                }
+                else
+                {
+                    ReplayDeferredIfEligible();
+                }
+                lock (_gate)
+                {
+                    if (_pauseAfterDeferred)
+                    {
+                        var (queued, queueError) = _queue.Len(Context);
+                        if (queueError is null && queued > _deferredQueued.Count)
+                        {
+                            _pauseAfterDeferred = false;
+                            continue;
+                        }
+                        if (_generatedCalls.Count > 0)
+                        {
+                            _pauseAfterDeferred = false;
+                            continue;
+                        }
+                        _pauseAfterDeferred = false;
+                        var completion = _processingCompletion;
+                        _processing = false;
+                        _processingCompletion = null;
+                        _processingThreadId = null;
+                        completion?.TrySetResult(true);
+                        return;
+                    }
                 }
             }
         }
@@ -1267,43 +2416,156 @@ internal sealed class RuntimeEngine
         }
     }
 
-    private void ReplayDeferred()
+    private void FlushGeneratedCalls()
     {
         lock (_gate)
         {
-            for (var index = 0; index < _deferred.Count; index++)
+            foreach (var call in _generatedCalls)
             {
-                var error = _queue.Push(Context, _deferred[index]);
+                if (call.LifecycleVersion != _lifecycleVersion
+                    || !IsStarted
+                    || call.ActivityProducer is not null
+                        && call.ActivityGeneration is int generation
+                        && !call.ActivityProducer.IsCurrentActivityGeneration(generation))
+                {
+                    continue;
+                }
+
+                var error = _queue.Push(Context, new PendingEvent(
+                    call.Event,
+                    call.ActivityProducer,
+                    call.ActivityGeneration));
+                if (error is not null)
+                {
+                    _queue.Push(Context, new PendingEvent(
+                        new ErrorEvent(error),
+                        call.ActivityProducer,
+                        call.ActivityGeneration));
+                }
+                Notify(_observers?.Dispatched, call.Event.Name);
+            }
+            _generatedCalls.Clear();
+        }
+    }
+
+    private void ReplayDeferredIfEligible()
+    {
+        lock (_gate)
+        {
+            if (_deferred.Count == 0)
+            {
+                return;
+            }
+
+            var (queued, queueError) = _queue.Len(Context);
+            if (queueError is not null || queued > 0)
+            {
+                return;
+            }
+
+            var pending = _deferred[0];
+            if (_model.DeferredMap.TryGetValue(_currentState.QualifiedName, out var deferredSet)
+                && deferredSet.Contains(pending.Event.Name))
+            {
+                return;
+            }
+
+            _deferred.RemoveAt(0);
+            _deferredOwners.Remove(pending);
+            _instance.OnEventRecalled(pending.Event);
+            if (!_deferredQueued.Contains(pending))
+            {
+                var error = _queue.Push(Context, pending);
                 if (error is not null)
                 {
                     _queue.Push(Context, new PendingEvent(new ErrorEvent(error)));
                 }
+                _deferredQueued.Add(pending);
             }
-
-            _deferred.Clear();
         }
     }
 
     private bool ProcessEvent(PendingEvent pending)
     {
+        lock (_gate)
+        {
+            if (_discardedDeferred.Remove(pending))
+            {
+                pending.Completion.TrySetResult(true);
+                return false;
+            }
+            if (_deferred.Contains(pending))
+            {
+                _deferredQueued.Remove(pending);
+                var activeState = _currentState.QualifiedName;
+                var stillDeferred = _model.DeferredMap.TryGetValue(activeState, out var currentDeferred)
+                    && currentDeferred.Contains(pending.Event.Name);
+                if (!stillDeferred)
+                {
+                    _deferred.Remove(pending);
+                    _deferredOwners.Remove(pending);
+                    _instance.OnEventRecalled(pending.Event);
+                }
+                else
+                {
+                    _skipDeferredReplay = true;
+                    _pauseAfterDeferred = true;
+                    if (_rebuildDeferredQueue)
+                    {
+                        _rebuildDeferredQueue = false;
+                        for (var index = _deferred.Count - 1; index >= 0; index--)
+                        {
+                            var deferred = _deferred[index];
+                            var rebuildError = _queue.Push(Context, deferred);
+                            if (rebuildError is not null)
+                            {
+                                _queue.Push(Context, new PendingEvent(new ErrorEvent(rebuildError)));
+                            }
+                            _deferredQueued.Add(deferred);
+                        }
+                        _pauseAfterDeferred = true;
+                    }
+                    return false;
+                }
+            }
+        }
+
         var currentQualifiedName = _currentState.QualifiedName;
+        var deferDepth = NearestDeferDepth(currentQualifiedName, pending.Event.Name);
+
+        if (TryRunTransitionBucket(currentQualifiedName, pending.Event.Name, pending, deferDepth))
+        {
+            return true;
+        }
 
         if (_model.DeferredMap.TryGetValue(currentQualifiedName, out var deferredSet) && deferredSet.Contains(pending.Event.Name))
         {
             lock (_gate)
             {
+                var hadDeferred = _deferred.Count > 0;
                 _deferred.Add(pending);
+                _deferredOwners[pending] = NearestDeferPath(currentQualifiedName, pending.Event.Name) ?? currentQualifiedName;
+                if (hadDeferred)
+                {
+                    _rebuildDeferredQueue = true;
+                }
+                else
+                {
+                    var error = _queue.Push(Context, pending);
+                    if (error is not null)
+                    {
+                        _queue.Push(Context, new PendingEvent(new ErrorEvent(error)));
+                    }
+                    _deferredQueued.Add(pending);
+                    _pauseAfterDeferred = true;
+                }
             }
 
+            _instance.OnEventDeferred(pending.Event);
             return false;
         }
 
-        if (TryRunTransitionBucket(currentQualifiedName, pending.Event.Name, pending))
-        {
-            return true;
-        }
-
-        if (pending.Event.Name != Event.AnyName && TryRunTransitionBucket(currentQualifiedName, Event.AnyName, pending))
+        if (pending.Event.Name != Event.AnyName && TryRunTransitionBucket(currentQualifiedName, Event.AnyName, pending, deferDepth))
         {
             return true;
         }
@@ -1312,7 +2574,29 @@ internal sealed class RuntimeEngine
         return false;
     }
 
-    private bool TryRunTransitionBucket(string currentQualifiedName, string eventName, PendingEvent pending)
+    private int NearestDeferDepth(string currentQualifiedName, string eventName)
+    {
+        foreach (var path in PathUtil.AncestorChain(currentQualifiedName, _model.QualifiedName))
+        {
+            if (_model.Resolve<State>(path) is State state && state.DeferredEvents.Contains(eventName))
+            {
+                return path.Count(character => character == '/');
+            }
+        }
+
+        return -1;
+    }
+
+    private string? NearestDeferPath(string currentQualifiedName, string eventName)
+    {
+        foreach (var path in PathUtil.AncestorChain(currentQualifiedName, _model.QualifiedName))
+        {
+            if (_model.Resolve<State>(path) is State state && state.DeferredEvents.Contains(eventName)) return path;
+        }
+        return null;
+    }
+
+    private bool TryRunTransitionBucket(string currentQualifiedName, string eventName, PendingEvent pending, int deferDepth)
     {
         if (!_model.TransitionMap.TryGetValue(currentQualifiedName, out var buckets) ||
             !buckets.TryGetValue(eventName, out var transitions))
@@ -1322,22 +2606,26 @@ internal sealed class RuntimeEngine
 
         foreach (var transition in transitions)
         {
+            if (!transition.Paths.ContainsKey(currentQualifiedName))
+            {
+                continue;
+            }
+
+            if (transition.OwnerQualifiedNameInternal != _model.QualifiedName
+                && deferDepth > transition.OwnerQualifiedNameInternal.Count(character => character == '/'))
+            {
+                continue;
+            }
+
             if (transition.Guard is not null)
             {
-                try
+                if (!EvaluateGuard(transition, pending.Event))
                 {
-                    if (!transition.Guard.Evaluate(Context, _instance, pending.Event))
-                    {
-                        continue;
-                    }
-                }
-                catch (Exception error)
-                {
-                    Dispatch(new ErrorEvent(error)).GetAwaiter().GetResult();
                     continue;
                 }
             }
 
+            PrepareDeferredReplay(currentQualifiedName, transition);
             var next = ExecuteTransitionFrom(currentQualifiedName, transition, pending.Event);
             _currentState = next;
             pending.Completion.TrySetResult(true);
@@ -1347,11 +2635,66 @@ internal sealed class RuntimeEngine
         return false;
     }
 
+    private void PrepareDeferredReplay(string currentQualifiedName, Transition transition)
+    {
+        if (_deferred.Count == 0
+            || !transition.Paths.TryGetValue(currentQualifiedName, out var path)
+            || path.Exit.Count == 0)
+        {
+            return;
+        }
+
+        var pending = _deferred[0];
+        if (!_model.DeferredMap.TryGetValue(currentQualifiedName, out var currentDeferred)
+            || !currentDeferred.Contains(pending.Event.Name))
+        {
+            return;
+        }
+
+        if (_model.DeferredMap.TryGetValue(transition.TargetQualifiedName, out var targetDeferred)
+            && targetDeferred.Contains(pending.Event.Name))
+        {
+            return;
+        }
+
+        if (_deferredOwners.TryGetValue(pending, out var deferredOwner)
+            && path.Exit.Any(exit => _model.Resolve<State>(exit)?.Kind == Kind.Submachine
+                && deferredOwner != exit
+                && PathUtil.IsDescendantOrSelf(deferredOwner, exit)))
+        {
+            _deferred.RemoveAt(0);
+            _deferredOwners.Remove(pending);
+            if (_deferredQueued.Remove(pending)) _discardedDeferred.Add(pending);
+            pending.Completion.TrySetResult(true);
+            return;
+        }
+
+        _deferred.RemoveAt(0);
+        _deferredOwners.Remove(pending);
+        _instance.OnEventRecalled(pending.Event);
+        if (!_deferredQueued.Contains(pending))
+        {
+            var error = _queue.Push(Context, pending);
+            if (error is not null)
+            {
+                _queue.Push(Context, new PendingEvent(new ErrorEvent(error)));
+            }
+            _deferredQueued.Add(pending);
+        }
+    }
+
     private State ExecuteTransitionFrom(string currentQualifiedName, Transition transition, Event @event)
     {
+        var lifecycleVersion = _lifecycleVersion;
         if (!transition.Paths.TryGetValue(currentQualifiedName, out var path))
         {
             return _currentState;
+        }
+
+        var targetVertex = _model.Resolve<Vertex>(transition.TargetQualifiedName);
+        if (path.Exit.Count > 0 && targetVertex is not HistoryPseudostate)
+        {
+            RecordHistory(currentQualifiedName);
         }
 
         foreach (var exiting in path.Exit)
@@ -1359,12 +2702,14 @@ internal sealed class RuntimeEngine
             if (_model.Resolve<State>(exiting) is State state)
             {
                 ExitState(state, @event);
+                if (lifecycleVersion != _lifecycleVersion) return _currentState;
             }
         }
 
         foreach (var effect in transition.Effects)
         {
             ExecuteBehavior(effect, @event);
+            if (lifecycleVersion != _lifecycleVersion) return _currentState;
         }
 
         if (transition.TransitionKind == TransitionKind.Internal)
@@ -1380,6 +2725,7 @@ internal sealed class RuntimeEngine
             }
 
             var entered = EnterVertex(vertex, @event, entering == transition.TargetQualifiedName);
+            if (lifecycleVersion != _lifecycleVersion) return _currentState;
             if (entering == transition.TargetQualifiedName)
             {
                 return entered;
@@ -1394,12 +2740,9 @@ internal sealed class RuntimeEngine
         switch (vertex)
         {
             case FinalStateNode finalState:
-                RecordHistory(finalState.QualifiedName);
                 Notify(_observers?.Entered, finalState.QualifiedName);
-                if (finalState.OwnerQualifiedName == _model.QualifiedName)
-                {
-                    Context.Cancel();
-                }
+                Dispatch(new CompletionEvent(CompletionEvent.EventName, source: finalState.OwnerQualifiedName))
+                    .GetAwaiter().GetResult();
 
                 return finalState;
 
@@ -1411,16 +2754,8 @@ internal sealed class RuntimeEngine
                 {
                     if (transition.Guard is not null)
                     {
-                        try
+                        if (!EvaluateGuard(transition, @event))
                         {
-                            if (!transition.Guard.Evaluate(Context, _instance, @event))
-                            {
-                                continue;
-                            }
-                        }
-                        catch (Exception error)
-                        {
-                            Dispatch(new ErrorEvent(error)).GetAwaiter().GetResult();
                             continue;
                         }
                     }
@@ -1440,21 +2775,24 @@ internal sealed class RuntimeEngine
 
     private State EnterState(State state, Event @event, bool defaultEntry)
     {
-        RecordHistory(state.QualifiedName);
-
+        var lifecycleVersion = _lifecycleVersion;
         foreach (var behavior in state.EntryBehaviors)
         {
             ExecuteBehavior(behavior, @event);
+            if (lifecycleVersion != _lifecycleVersion || !IsStarted) return _currentState;
         }
 
         Notify(_observers?.Entered, state.QualifiedName);
 
         var cancellation = new CancellationTokenSource();
-        _activeScopes[state.QualifiedName] = new StateScope(cancellation);
+        var scope = new StateScope(cancellation);
+        _activeScopes[state.QualifiedName] = scope;
 
         foreach (var activity in state.Activities)
         {
-            ExecuteBehavior(activity, @event, cancellation.Token);
+            var activityCancellation = new CancellationTokenSource();
+            scope.Activities.Add(activityCancellation);
+            ExecuteBehavior(activity, @event, activityCancellation.Token);
         }
 
         ScheduleTemporalTransitions(state, cancellation.Token);
@@ -1509,7 +2847,7 @@ internal sealed class RuntimeEngine
 
         foreach (var transition in history.Transitions)
         {
-            if (transition.Guard is not null && !transition.Guard.Evaluate(Context, _instance, @event))
+            if (transition.Guard is not null && !EvaluateGuard(transition, @event))
             {
                 continue;
             }
@@ -1534,65 +2872,178 @@ internal sealed class RuntimeEngine
     {
         if (!behavior.Concurrent)
         {
+            var synchronousExecution = PushExecution(this, behavior.ResolutionScope ?? behavior.OwnerQualifiedName);
             try
             {
-                behavior.Invoke(Context, _instance, @event);
+                behavior.Invoke(Context, _instance, @event).GetAwaiter().GetResult();
             }
-            catch (Exception error)
+            finally
             {
-                Dispatch(new ErrorEvent(error)).GetAwaiter().GetResult();
+                RestoreExecution(synchronousExecution);
             }
-
             return;
         }
 
         var token = cancellationToken ?? Context.CancellationToken;
-        var behaviorContext = Context.CreateLinked(token);
-        _ = Task.Run(() =>
+        var activityGeneration = _lifecycleVersion;
+        var behaviorContext = Context.CreateLinked(token, this, activityGeneration);
+        ValueTask pending;
+        var previousProducer = ActivityProducer.Value;
+        var previousGeneration = ActivityGeneration.Value;
+        var previousExecution = PushExecution(this, behavior.ResolutionScope ?? behavior.OwnerQualifiedName);
+        ActivityProducer.Value = this;
+        ActivityGeneration.Value = activityGeneration;
+        try
         {
+            pending = behavior.Invoke(behaviorContext, _instance, @event);
+        }
+        catch (Exception error)
+        {
+            ActivityProducer.Value = previousProducer;
+            ActivityGeneration.Value = previousGeneration;
+            RestoreExecution(previousExecution);
+            CompleteConcurrentBehavior(behavior, behaviorContext, token, error);
+            return;
+        }
+        finally
+        {
+            ActivityProducer.Value = previousProducer;
+            ActivityGeneration.Value = previousGeneration;
+            RestoreExecution(previousExecution);
+        }
+
+        if (pending.IsCompleted)
+        {
+            Exception? error = null;
             try
             {
-                behavior.Invoke(behaviorContext, _instance, @event);
+                pending.GetAwaiter().GetResult();
             }
-            catch (Exception error)
+            catch (Exception caught)
             {
-                if (!token.IsCancellationRequested)
-                {
-                    Dispatch(new ErrorEvent(error)).GetAwaiter().GetResult();
-                }
+                error = caught;
             }
-            finally
+
+            CompleteConcurrentBehavior(behavior, behaviorContext, token, error);
+            return;
+        }
+
+        _ = AwaitConcurrentBehavior(pending, behavior, behaviorContext, token);
+    }
+
+    private bool EvaluateGuard(Transition transition, Event @event)
+    {
+        if (transition.Guard is null) return true;
+        var previousExecution = PushExecution(CurrentProducer, transition.SourceQualifiedName);
+        try
+        {
+            return transition.Guard.Evaluate(Context, _instance, @event);
+        }
+        finally
+        {
+            RestoreExecution(previousExecution);
+        }
+    }
+
+    private async Task AwaitConcurrentBehavior(
+        ValueTask pending,
+        Behavior behavior,
+        Context behaviorContext,
+        CancellationToken cancellationToken)
+    {
+        Exception? error = null;
+        try
+        {
+            await pending.ConfigureAwait(false);
+        }
+        catch (Exception caught)
+        {
+            error = caught;
+        }
+
+        ActivityProducer.Value = null;
+        CompleteConcurrentBehavior(behavior, behaviorContext, cancellationToken, error);
+    }
+
+    private void CompleteConcurrentBehavior(
+        Behavior behavior,
+        Context behaviorContext,
+        CancellationToken cancellationToken,
+        Exception? error)
+    {
+        try
+        {
+            if (error is not null && !cancellationToken.IsCancellationRequested)
             {
-                NotifyExecuted(behavior.QualifiedName);
-                NotifyExecuted(behavior.OwnerQualifiedName);
-                behaviorContext.Dispose();
+                Dispatch(new ErrorEvent(error)).GetAwaiter().GetResult();
             }
-        });
+        }
+        finally
+        {
+            NotifyExecuted(behavior.QualifiedName);
+            NotifyExecuted(behavior.OwnerQualifiedName);
+            behaviorContext.Dispose();
+            StartQueuedWork();
+        }
+    }
+
+    private void StartQueuedWork()
+    {
+        lock (_gate)
+        {
+            if (_processing || !IsStarted || Context.IsDone)
+            {
+                return;
+            }
+
+            _processing = true;
+            _processingCompletion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        }
+
+        _ = Task.Run(ProcessQueueWorker);
     }
 
     private void ScheduleTemporalTransitions(State state, CancellationToken cancellationToken)
     {
-        foreach (var transition in state.Transitions.Where(candidate => candidate.TemporalDefinitions.Count > 0))
+        var transitions = _model.Members.Values
+            .OfType<Transition>()
+            .Where(candidate => candidate.SourceQualifiedName == state.QualifiedName
+                && candidate.TemporalDefinitions.Count > 0)
+            .ToArray();
+        if (transitions.Length == 0)
         {
-            foreach (var temporal in transition.TemporalDefinitions)
+            return;
+        }
+
+        var previousExecution = PushExecution(CurrentProducer, state.QualifiedName);
+        try
+        {
+            foreach (var transition in transitions)
             {
-                var temporalEvent = new Event(temporal.EventName, temporal.EventKind);
-                switch (temporal.Kind)
+                foreach (var temporal in transition.TemporalDefinitions)
                 {
-                    case TemporalKind.After:
-                        ScheduleAfter(temporal, temporalEvent, cancellationToken);
-                        break;
-                    case TemporalKind.At:
-                        ScheduleAt(temporal, temporalEvent, cancellationToken);
-                        break;
-                    case TemporalKind.Every:
-                        ScheduleEvery(temporal, temporalEvent, cancellationToken);
-                        break;
-                    case TemporalKind.When:
-                        ScheduleWhen(temporal, temporalEvent, cancellationToken);
-                        break;
+                    var temporalEvent = new Event(temporal.EventName, temporal.EventKind);
+                    switch (temporal.Kind)
+                    {
+                        case TemporalKind.After:
+                            ScheduleAfter(temporal, temporalEvent, cancellationToken);
+                            break;
+                        case TemporalKind.At:
+                            ScheduleAt(temporal, temporalEvent, cancellationToken);
+                            break;
+                        case TemporalKind.Every:
+                            ScheduleEvery(temporal, temporalEvent, cancellationToken);
+                            break;
+                        case TemporalKind.When:
+                            ScheduleWhen(temporal, temporalEvent, cancellationToken);
+                            break;
+                    }
                 }
             }
+        }
+        finally
+        {
+            RestoreExecution(previousExecution);
         }
     }
 
@@ -1603,13 +3054,23 @@ internal sealed class RuntimeEngine
             return;
         }
 
-        var duration = temporal.Duration(Context, _instance, @event);
+        TimeSpan duration;
+        try
+        {
+            duration = temporal.Duration(Context, _instance, @event);
+        }
+        catch (Exception error)
+        {
+            Dispatch(new ErrorEvent(error)).GetAwaiter().GetResult();
+            return;
+        }
         if (duration < TimeSpan.Zero)
         {
             return;
         }
 
-        _ = Task.Run(async () =>
+        _ = Run();
+        async Task Run()
         {
             try
             {
@@ -1622,7 +3083,14 @@ internal sealed class RuntimeEngine
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
             }
-        });
+            catch (Exception error)
+            {
+                if (!cancellationToken.IsCancellationRequested)
+                {
+                    await Dispatch(new ErrorEvent(error)).ConfigureAwait(false);
+                }
+            }
+        }
     }
 
     private void ScheduleAt(TemporalDefinition temporal, Event @event, CancellationToken cancellationToken)
@@ -1632,13 +3100,23 @@ internal sealed class RuntimeEngine
             return;
         }
 
-        var due = temporal.Time(Context, _instance, @event) - Clock.Now();
+        TimeSpan due;
+        try
+        {
+            due = temporal.Time(Context, _instance, @event) - Clock.Now();
+        }
+        catch (Exception error)
+        {
+            Dispatch(new ErrorEvent(error)).GetAwaiter().GetResult();
+            return;
+        }
         if (due < TimeSpan.Zero)
         {
             due = TimeSpan.Zero;
         }
 
-        _ = Task.Run(async () =>
+        _ = Run();
+        async Task Run()
         {
             try
             {
@@ -1651,7 +3129,14 @@ internal sealed class RuntimeEngine
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
             }
-        });
+            catch (Exception error)
+            {
+                if (!cancellationToken.IsCancellationRequested)
+                {
+                    await Dispatch(new ErrorEvent(error)).ConfigureAwait(false);
+                }
+            }
+        }
     }
 
     private void ScheduleEvery(TemporalDefinition temporal, Event @event, CancellationToken cancellationToken)
@@ -1661,7 +3146,8 @@ internal sealed class RuntimeEngine
             return;
         }
 
-        _ = Task.Run(async () =>
+        _ = Run();
+        async Task Run()
         {
             try
             {
@@ -1685,7 +3171,14 @@ internal sealed class RuntimeEngine
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
             }
-        });
+            catch (Exception error)
+            {
+                if (!cancellationToken.IsCancellationRequested)
+                {
+                    await Dispatch(new ErrorEvent(error)).ConfigureAwait(false);
+                }
+            }
+        }
     }
 
     private void ScheduleWhen(TemporalDefinition temporal, Event @event, CancellationToken cancellationToken)
@@ -1737,6 +3230,11 @@ internal sealed class RuntimeEngine
     {
         if (_activeScopes.Remove(state.QualifiedName, out var scope))
         {
+            foreach (var activity in scope.Activities)
+            {
+                activity.Cancel();
+                activity.Dispose();
+            }
             scope.Cancellation.Cancel();
             scope.Cancellation.Dispose();
         }
@@ -1841,11 +3339,42 @@ internal sealed class RuntimeEngine
         }
     }
 
-    private object? InvokeOperation(OperationDefinition operation, Context context, object?[] args)
+    private object? InvokeOperation(
+        OperationDefinition operation,
+        Context context,
+        object?[] args,
+        CallData callData)
     {
         var callback = operation.Callback;
         if (callback is null)
         {
+            foreach (var method in _instance.GetType().GetMethods(BindingFlags.Instance | BindingFlags.Public)
+                         .Where(method => method.Name == operation.Name))
+            {
+                foreach (var useContext in new[] { true, false })
+                {
+                    if (!TryBuildCallArguments(
+                            method.GetParameters(),
+                            useContext,
+                            useInstance: false,
+                            context,
+                            args,
+                            out var instanceArgs))
+                    {
+                        continue;
+                    }
+
+                    try
+                    {
+                        return method.Invoke(_instance, instanceArgs);
+                    }
+                    catch (TargetInvocationException exception) when (exception.InnerException is not null)
+                    {
+                        throw exception.InnerException;
+                    }
+                }
+            }
+
             throw new MissingOperationException(operation.QualifiedName);
         }
 
@@ -1874,6 +3403,29 @@ internal sealed class RuntimeEngine
                 }
 
                 return result;
+            }
+            catch (TargetInvocationException exception) when (exception.InnerException is not null)
+            {
+                throw exception.InnerException;
+            }
+        }
+
+        foreach (var candidate in candidates)
+        {
+            if (!TryBuildCallArguments(
+                    parameters,
+                    candidate.useContext,
+                    candidate.useInstance,
+                    context,
+                    [callData],
+                    out var callArgs))
+            {
+                continue;
+            }
+
+            try
+            {
+                return callback.DynamicInvoke(callArgs);
             }
             catch (TargetInvocationException exception) when (exception.InnerException is not null)
             {
@@ -1990,6 +3542,21 @@ internal sealed class RuntimeEngine
         }
     }
 
-    private string QualifyAttribute(string attributeName) => PathUtil.Join(_model.QualifiedName, attributeName);
-    private string QualifyOperation(string operationName) => PathUtil.Join(_model.QualifiedName, operationName);
+    private string QualifyAttribute(string attributeName) =>
+        QualifyScoped(_model.Attributes.Keys, attributeName);
+
+    private string QualifyOperation(string operationName) =>
+        QualifyScoped(_model.Operations.Keys, operationName);
+
+    private string QualifyScoped(IEnumerable<string> names, string name)
+    {
+        if (name.StartsWith("/", StringComparison.Ordinal)) return PathUtil.Join(name);
+        var known = names as ICollection<string> ?? names.ToArray();
+        foreach (var scope in PathUtil.AncestorChain(CurrentResolutionScope ?? _currentState.QualifiedName, _model.QualifiedName))
+        {
+            var candidate = PathUtil.Join(scope, name);
+            if (known.Contains(candidate)) return candidate;
+        }
+        return PathUtil.Join(_model.QualifiedName, name);
+    }
 }

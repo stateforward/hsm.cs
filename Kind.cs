@@ -27,7 +27,8 @@ public enum Kind
     ConcurrentBehavior,
     Constraint,
     Attribute,
-    Operation
+    Operation,
+    Submachine
 }
 
 public enum TransitionKind
